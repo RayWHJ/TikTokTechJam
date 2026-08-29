@@ -12,9 +12,15 @@ Configure via environment variables (all optional, sensible defaults below):
     LLM_CALLS_API_KEY        overrides OPENAI_API_KEY if you want a
                               separate key/budget for this module
     LLM_CALLS_MODEL          model used for diagnose / hypothesis / audit /
-                              literature grounding  (default: gpt-5)
+                              literature grounding  (default: gpt-4o-mini)
     LLM_CALLS_CHEAP_MODEL    smaller/cheaper model used for dedup escalation
                               (default: gpt-4.1-nano)
+
+Note on temperature: intentionally omitted from the Responses API calls.
+Reasoning models (gpt-5, o-series) reject the parameter outright, and for
+the non-reasoning defaults the small quality gain from tuning it isn't
+worth the portability cost. If a downstream caller needs sampling
+variance, add it back guarded by a model-family check.
 """
 
 from __future__ import annotations
@@ -24,7 +30,7 @@ from typing import Optional
 
 import openai
 
-DEFAULT_MODEL = os.environ.get("LLM_CALLS_MODEL", "gpt-5")
+DEFAULT_MODEL = os.environ.get("LLM_CALLS_MODEL", "gpt-4o-mini")
 DEFAULT_CHEAP_MODEL = os.environ.get("LLM_CALLS_CHEAP_MODEL", "gpt-4.1-nano")
 
 _client: Optional[openai.OpenAI] = None
@@ -42,27 +48,21 @@ def get_client() -> openai.OpenAI:
 
 
 def call_model_text(system: str, user: str, model: str = DEFAULT_MODEL,
-                    max_tokens: int = 2000, temperature: float = 0.2) -> str:
+                    max_tokens: int = 2000) -> str:
     """Plain text-in/text-out call via the Responses API, no tools.
-    Returns the model's response as a single string.
-
-    Note: some reasoning-heavy models (o-series) reject `temperature` or
-    require it to be 1.0. gpt-5 and gpt-4.1-nano — the defaults — accept
-    it fine. If you switch to an o-series model and hit a param error,
-    drop the temperature kwarg from this call site."""
+    Returns the model's response as a single string."""
     client = get_client()
     resp = client.responses.create(
         model=model,
         instructions=system,
         input=user,
         max_output_tokens=max_tokens,
-        temperature=temperature,
     )
     return resp.output_text
 
 
 def call_model_with_search(system: str, user: str, model: str = DEFAULT_MODEL,
-                            max_tokens: int = 3000, temperature: float = 0.2) -> str:
+                            max_tokens: int = 3000) -> str:
     """Retrieval-enabled call using OpenAI's server-executed web_search
     tool via the Responses API. The search happens inside this single API
     call (the server runs the tool itself); we only need to read back the
@@ -77,7 +77,6 @@ def call_model_with_search(system: str, user: str, model: str = DEFAULT_MODEL,
         instructions=system,
         input=user,
         max_output_tokens=max_tokens,
-        temperature=temperature,
         tools=[{"type": "web_search"}],
     )
     return resp.output_text
