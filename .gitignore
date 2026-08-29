@@ -3,5 +3,7 @@ KuaiRand-Pure/data/
 __pycache__/
 *.pyc
 .harness_cache/
+.llm_calls_cache/
 .pytest_cache/
 .venv/
+orchestrator/_state/
