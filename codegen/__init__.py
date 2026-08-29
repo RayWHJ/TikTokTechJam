@@ -20,14 +20,14 @@ from .sandbox import execute
 from .debug import debug_and_retry, is_semantic_change
 from .submission import check_submission
 from .report import synthesize_report
-from .llm_client import LLMClient, FakeBackend, AnthropicBackend, get_default_client
+from .llm_client import LLMClient, FakeBackend, OpenAIBackend, get_default_client
 from .constants import (NON_CAUSAL_COLUMNS, AUXILIARY_SIGNALS,
                         ORACLE_PRIMARY_CEILING, FM_BASELINE_TEST_PRIMARY)
 
 __all__ = [
     "write_fix", "pre_execution_gate", "execute", "debug_and_retry",
     "is_semantic_change", "check_submission", "synthesize_report",
-    "LLMClient", "FakeBackend", "AnthropicBackend", "get_default_client",
+    "LLMClient", "FakeBackend", "OpenAIBackend", "get_default_client",
     "NON_CAUSAL_COLUMNS", "AUXILIARY_SIGNALS",
     "ORACLE_PRIMARY_CEILING", "FM_BASELINE_TEST_PRIMARY",
 ]

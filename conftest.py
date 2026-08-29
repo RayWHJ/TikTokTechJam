@@ -11,7 +11,7 @@ also pins the default data directory to an absolute path so a candidate run from
 a scratch working directory still finds the dataset.
 
 Force the offline fake LLM backend for all tests, regardless of any ambient
-ANTHROPIC_API_KEY.
+OPENAI_API_KEY.
 """
 import os
 import sys

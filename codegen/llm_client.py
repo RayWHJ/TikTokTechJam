@@ -6,8 +6,8 @@ final report (report). Those three call a *code/writing* model — separate from
 Person C's reasoning calls. This module is that model client, built so the whole
 package is testable **offline, with no API key**:
 
-  * AnthropicBackend — used only when the `anthropic` SDK is importable AND
-    ANTHROPIC_API_KEY is set AND CODEGEN_LLM_BACKEND != "fake".
+  * OpenAIBackend — used only when the `OpenAI` SDK is importable AND
+    OpenAI_API_KEY is set AND CODEGEN_LLM_BACKEND != "fake".
   * FakeBackend — deterministic, no network. Produces plausible, gate-clean
     output keyed on the `kind` of request. This is the default, so
     `writer.write_fix(...)` and `report.synthesize_report(...)` run end-to-end
@@ -18,9 +18,9 @@ can inject the real backend later — swapping backends is a one-liner, no code 
 writer/debug/report changes.
 
 Env vars:
-  CODEGEN_LLM_BACKEND  = "fake" | "anthropic"   (default: auto-detect)
+  CODEGEN_LLM_BACKEND  = "fake" | "openai"   (default: auto-detect)
   CODEGEN_LLM_MODEL    = model id string for the real backend
-  ANTHROPIC_API_KEY    = credential for the real backend
+  OPENAI_API_KEY    = credential for the real backend
 """
 from __future__ import annotations
 import os, json, textwrap, hashlib
@@ -39,28 +39,33 @@ class LLMError(RuntimeError):
 # --------------------------------------------------------------------------- #
 #  Backends                                                                    #
 # --------------------------------------------------------------------------- #
-class AnthropicBackend:
+class OpenAIBackend:
     """Real backend. Kept deliberately small; only used when explicitly available."""
 
     def __init__(self, model: str | None = None):
         try:
-            import anthropic  # noqa: F401
+            import openai  # noqa: F401
         except Exception as e:                       # pragma: no cover - env dependent
-            raise LLMError(f"anthropic SDK not importable: {e}")
-        if not os.environ.get("ANTHROPIC_API_KEY"):
-            raise LLMError("ANTHROPIC_API_KEY not set")
-        import anthropic
-        self._client = anthropic.Anthropic()
+            raise LLMError(f"OpenAI SDK not importable: {e}")
+        if not os.environ.get("OPENAI_API_KEY"):
+            raise LLMError("OPENAI_API_KEY not set")
+        import openai
+        self._client = openai.OpenAI()
         # Model id is intentionally env-driven so this package pins nothing stale.
-        self.model = model or os.environ.get("CODEGEN_LLM_MODEL", "claude-sonnet-4-5")
+        self.model = model or os.environ.get("CODEGEN_LLM_MODEL", "gpt-4o-mini")
 
     def complete(self, system: str, user: str, kind: str,
                  max_tokens: int = 4000, temperature: float = 0.0) -> str:  # pragma: no cover
-        msg = self._client.messages.create(
-            model=self.model, max_tokens=max_tokens, temperature=temperature,
-            system=system, messages=[{"role": "user", "content": user}],
+        # Temperature intentionally not forwarded — reasoning models (gpt-5,
+        # o-series) reject the parameter; the codegen paths call with 0.0
+        # anyway, and this keeps the client portable across model families.
+        resp = self._client.responses.create(
+            model=self.model,
+            instructions=system,
+            input=user,
+            max_output_tokens=max_tokens,
         )
-        return "".join(getattr(b, "text", "") for b in msg.content)
+        return resp.output_text
 
 
 class FakeBackend:
@@ -209,13 +214,13 @@ class LLMClient:
         choice = os.environ.get("CODEGEN_LLM_BACKEND", "").lower()
         if choice == "fake":
             return FakeBackend()
-        if choice == "anthropic":
-            return AnthropicBackend()
+        if choice == "openai":
+            return OpenAIBackend()
         # auto: prefer real only if clearly available, else fake.
         try:
-            import anthropic  # noqa: F401
-            if os.environ.get("ANTHROPIC_API_KEY"):
-                return AnthropicBackend()
+            import openai  # noqa: F401
+            if os.environ.get("OPENAI_API_KEY"):
+                return OpenAIBackend()
         except Exception:
             pass
         return FakeBackend()

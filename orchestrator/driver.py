@@ -1,4 +1,7 @@
 """Main orchestrator loop. Swap the mock imports below when real PRs land."""
+from dotenv import load_dotenv
+load_dotenv() 
+
 import hashlib
 import time
 import uuid
@@ -43,10 +46,22 @@ def _new_root() -> Node:
 
 
 def _fingerprint(h: dict):
-    return (h.get("loss_type", "pointwise_logloss"),
-            h.get("sampler", "uniform"),
-            h.get("feature_set", "5field_baseline"),
-            h.get("dataset_tier", "pure"))
+    """Semantic fingerprint of a hypothesis.
+
+    If the hypothesis declares structured fields, use them (this keeps the
+    hand-authored preseeds in memory.py meaningful). Otherwise fall back to
+    a hash of the mechanism string, so distinct proposals don't all collapse
+    to the same default 4-tuple.
+    """
+    structured_keys = ("loss_type", "sampler", "feature_set", "dataset_tier")
+    if any(k in h for k in structured_keys):
+        return (h.get("loss_type", "pointwise_logloss"),
+                h.get("sampler", "uniform"),
+                h.get("feature_set", "5field_baseline"),
+                h.get("dataset_tier", "pure"))
+    mech = (h.get("mechanism") or "").strip().lower()
+    digest = hashlib.sha1(mech.encode("utf-8")).hexdigest()[:16]
+    return ("mechanism_hash", digest, "", "")
 
 
 def _diff_hash(diff: str) -> str:

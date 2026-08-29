@@ -1,5 +1,5 @@
 # codegen/ runtime needs only numpy (already required by the starter kit).
 # For the real LLM backend (optional; offline fake backend is default):
-anthropic>=0.39
+openai>=1.5
 # For the test suite:
 pytest>=7
