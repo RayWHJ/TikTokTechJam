@@ -1,0 +1,8 @@
+KuaiRand-Pure.tar.gz
+KuaiRand-Pure/data/
+__pycache__/
+*.pyc
+.venv/
+.pytest_cache/
+orchestrator/_state/
+EOF
