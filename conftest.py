@@ -15,8 +15,4 @@ if ROOT not in sys.path:
 
 os.environ.setdefault('HARNESS_DATA_DIR', os.path.join(ROOT, 'KuaiRand-Pure', 'data'))
 
-
-def pytest_configure(config):
-    config.addinivalue_line(
-        'markers', 'slow: baseline reproduction checks that train models (minutes)'
-    )
+# Markers and the default "not slow" filter live in pytest.ini.
