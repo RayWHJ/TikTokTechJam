@@ -176,9 +176,13 @@ def test_check_provenance_point_in_time_override():
 # ---------------------------------------------------------------------------
 
 def test_test_split_is_one_shot():
+    # get_encoded is stubbed out: the gate is checked before any data is touched,
+    # and a real load+encode would add ~34s to the suite for no extra coverage.
+    # tests/sanity_check_fm.py is where real feature arrays get exercised.
     code = (
-        "import harness\n"
-        "harness.get_split('test')\n"
+        "import harness, harness._split as s\n"
+        "s.get_encoded = lambda data_dir=None: {'enc': {'test': ('X', 'y', 'u')}}\n"
+        "assert harness.get_split('test') == ('X', 'y', 'u')\n"
         "try:\n"
         "    harness.get_split('test')\n"
         "    raise SystemExit(1)\n"
