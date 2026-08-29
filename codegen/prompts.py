@@ -26,27 +26,45 @@ HARD RULES (a static gate rejects any diff that violates these, before it runs):
    fed into the model as an input feature array.
 Output ONLY a unified diff in a ```diff fenced block. No prose outside it."""
 
+# Diff-format rules. A patch that does not apply is a wasted iteration, and the
+# two failure modes below are the ones actually observed from the model: headers
+# without the a/ b/ prefix (so `patch -p1` reports "can't find file to patch"),
+# and normal/ed-format output (`18a19,22`, `> line`) which is not a patch at all.
+_DIFF_FORMAT_RULES = """\
+OUTPUT FORMAT — return the COMPLETE updated file, not a diff:
+5. Output the entire file after your change, inside one ```python fenced block.
+   The caller computes the diff itself, so you never write @@ headers.
+6. Reproduce every unchanged line exactly as given, including comments,
+   docstrings and non-ASCII text. Do NOT reformat or reindent untouched code.
+7. NEVER elide anything. No `...`, no `# unchanged`, no `# rest of file`. A
+   truncated file is rejected outright and the attempt is wasted.
+8. Keep the change minimal: the output should differ from the input only where
+   the mechanism requires it."""
+
 WRITER_SYSTEM_MODEL = f"""\
 You are a precise ML systems engineer editing a numpy Factorization Machine.
 You modify ONLY baseline.py's model / loss / training loop. You do not touch
 data.py's feature encoding, evaluate.py, or submit.py. Keep the change minimal
 and self-contained; preserve the public run/predict interface so the harness can
 still score outputs.
-{_SAFETY_RULES}"""
+{_SAFETY_RULES}
+{_DIFF_FORMAT_RULES}"""
 
 WRITER_SYSTEM_DATA = f"""\
 You are a precise ML feature engineer editing data.py's feature encoding for a
 numpy Factorization Machine. You modify ONLY data.py (the FIELDS list and the
 encode()/raw() logic). You do not change the model or loss. Any new feature must
 be derivable from columns known at serving time for that row.
-{_SAFETY_RULES}"""
+{_SAFETY_RULES}
+{_DIFF_FORMAT_RULES}"""
 
 DEBUG_SYSTEM = f"""\
 You are debugging a failed candidate for a numpy FM ranking pipeline. Given the
 current file and a traceback (or divergence report), produce the SMALLEST diff
 that makes it run correctly. Do not opportunistically change the model, loss, or
 features unless the fix genuinely requires it.
-{_SAFETY_RULES}"""
+{_SAFETY_RULES}
+{_DIFF_FORMAT_RULES}"""
 
 SANITY_SYSTEM = """\
 You are a skeptical ML reviewer. You are shown a code diff, the stated
@@ -91,7 +109,24 @@ Current {file_name} content:
 {file_content}
 ```
 
-Produce a unified diff against {file_name} implementing the mechanism above."""
+Return the COMPLETE updated {file_name} in one ```python block, implementing the
+mechanism above. Reproduce all untouched lines verbatim and elide nothing."""
+
+
+def build_diff_repair_suffix(file_name: str, apply_error: str) -> str:
+    """Appended to the writer message when the previous attempt was unusable.
+
+    Feeding back the concrete reason is what makes the retry worth spending —
+    the model sees whether it truncated the file, elided code, or produced an
+    unapplyable patch, instead of guessing.
+    """
+    return f"""
+
+Your previous answer was REJECTED: {apply_error.strip()}
+
+Return the COMPLETE updated {file_name} again, in one ```python block. Every
+line of the original must be present unless your change removes it. Do not
+abbreviate, do not use `...`, and do not emit a diff."""
 
 
 def build_debug_user(file_name: str, file_content: str, error_context: str) -> str:

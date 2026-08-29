@@ -8,3 +8,5 @@ __pycache__/
 .venv/
 orchestrator/_state/
 .env
+bundle_code.py
+bundle_code.html

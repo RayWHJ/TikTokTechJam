@@ -23,7 +23,7 @@ Env vars:
   OPENAI_API_KEY    = credential for the real backend
 """
 from __future__ import annotations
-import os, json, textwrap, hashlib
+import os, json, re, textwrap, hashlib
 
 # request "kinds" — the fake backend switches on these; the real backend ignores.
 KIND_DIFF = "diff"        # writer: produce a code diff
@@ -92,10 +92,37 @@ class FakeBackend:
         # emits — robust, since both system prompts mention the word "feature".
         return "file to edit: data.py" in user.lower()
 
+    @staticmethod
+    def _real_unified_diff(user: str, file_name: str, note_lines: list[str]) -> str | None:
+        """Return a full-file rewrite, matching the writer's real contract.
+
+        The illustrative diffs below use pseudo-hunk headers (`@@ class FM`), so
+        they are not patches at all and writer.diff_applies rightly rejects them.
+        Echoing back the real file content from the prompt — plus a comment —
+        exercises the writer's full-file path, and it cannot drift when
+        baseline.py / data.py change.
+        """
+        m = re.search(r"```python\s*\n(.*?)```", user, re.DOTALL)
+        if not m:
+            return None
+        content = m.group(1)
+        if len(content.splitlines()) < 3:
+            return None
+        return "```python\n" + "\n".join(note_lines) + "\n" + content + "```\n"
+
     def _fake_diff(self, system: str, user: str) -> str:
         """Return a small, contract-CLEAN unified diff so the gate passes.
         Two shapes: a within-user BPR loss patch on baseline.py (model/loss), or
         an extra causal categorical field on data.py (features)."""
+        targets_data = self._targets_data(system, user)
+        file_name = "data.py" if targets_data else "baseline.py"
+        note = (["# fake feature patch: point-in-time-safe hour bucket only."]
+                if targets_data else
+                ["# fake loss patch: within-user BPR replaces pointwise logloss.",
+                 "# model selection stays on the validation splits."])
+        real = self._real_unified_diff(user, file_name, note)
+        if real is not None:
+            return real
         if self._targets_data(system, user):
             return textwrap.dedent('''\
                 ```diff

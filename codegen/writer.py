@@ -8,7 +8,9 @@ training loop." The relevant existing file's content is passed to the model as
 context, together with hypothesis['mechanism'] and hypothesis['implementation_sketch'].
 """
 from __future__ import annotations
-import os, re
+import difflib, os, re, shutil, subprocess, tempfile
+
+from .diffnorm import normalize_unified_diff
 
 from .constants import FEATURE_COMPONENTS
 from . import prompts
@@ -44,8 +46,94 @@ def _extract_diff(text: str) -> str:
     return text.strip() + "\n"
 
 
+#: Strip levels and tools tried, in order, when checking whether a diff applies.
+#: Both -p1 (`a/baseline.py`) and -p0 (`baseline.py`) headers occur in practice.
+#: stdin is closed because `patch` prompts "File to patch:" when no level fits.
+_APPLY_CHECKS = (
+    ["patch", "-p1", "--dry-run", "-i", "_patch.diff"],
+    ["patch", "-p0", "--dry-run", "-i", "_patch.diff"],
+    ["git", "apply", "--check", "--unsafe-paths", "_patch.diff"],
+    ["git", "apply", "--check", "--unsafe-paths", "-p0", "_patch.diff"],
+)
+
+
+#: Rewrites shorter than this fraction of the original are treated as truncated.
+_MIN_REWRITE_RATIO = 0.6
+#: Elision markers that mean the model summarised instead of reproducing code.
+_ELISION_RE = re.compile(
+    r"^\s*(?:\.\.\.|#\s*(?:\.\.\.|rest of|remainder|unchanged|as before|"
+    r"same as|omitted|truncated)\b)", re.IGNORECASE | re.MULTILINE)
+
+
+def _extract_python(text: str) -> str | None:
+    """Return the largest ```python (or bare ```) fenced block, if any."""
+    blocks = re.findall(r"```(?:python)?\s*\n(.*?)```", text, re.DOTALL)
+    return max(blocks, key=len) if blocks else None
+
+
+def rewrite_to_diff(rewritten: str, original: str, file_name: str) -> tuple[str, str]:
+    """Turn a full-file rewrite into a unified diff. Returns (diff, error).
+
+    Asking the model for the whole file and diffing locally removes every
+    patch-format failure mode at once — no hunk headers to miscount, no context
+    lines to retype, no strip level to guess. A difflib-generated diff applies by
+    construction. The cost is guarding against the one new failure mode: a model
+    that abbreviates the file instead of reproducing it.
+    """
+    if not rewritten.strip():
+        return "", "empty rewrite"
+    if _ELISION_RE.search(rewritten):
+        return "", ("the file was elided (`...` / `# rest of file`) instead of "
+                    "reproduced in full")
+    old_lines = original.splitlines(keepends=True)
+    new_lines = rewritten.splitlines(keepends=True)
+    if not new_lines or len(new_lines) < _MIN_REWRITE_RATIO * len(old_lines):
+        return "", (f"rewrite looks truncated: {len(new_lines)} lines vs "
+                    f"{len(old_lines)} in the original")
+    if not new_lines[-1].endswith("\n"):
+        new_lines[-1] += "\n"
+    diff = "".join(difflib.unified_diff(
+        old_lines, new_lines, f"a/{file_name}", f"b/{file_name}", n=3))
+    if not diff.strip():
+        return "", "rewrite is identical to the original (no change made)"
+    return diff, ""
+
+
+def diff_applies(diff: str, file_name: str, root: str = ".") -> tuple[bool, str]:
+    """Dry-run `diff` against a pristine copy of file_name.
+
+    Returns (ok, error_text). Checking here rather than at execute time means a
+    malformed patch costs one cheap retry instead of a gate + audit + sandbox
+    run that can only fail.
+    """
+    if not diff.strip():
+        return False, "empty diff"
+    work = tempfile.mkdtemp(prefix="codegen_diffcheck_")
+    try:
+        src = os.path.join(root, file_name)
+        if not os.path.exists(src):
+            return False, f"{file_name} not found under root {root!r}"
+        shutil.copy2(src, os.path.join(work, file_name))
+        with open(os.path.join(work, "_patch.diff"), "w", encoding="utf-8") as fh:
+            fh.write(diff)
+        errors = []
+        for cmd in _APPLY_CHECKS:
+            proc = subprocess.run(cmd, cwd=work, stdin=subprocess.DEVNULL,
+                                  capture_output=True, text=True)
+            if proc.returncode == 0:
+                return True, ""
+            errors.append(f"$ {' '.join(cmd)}\n"
+                          f"{(proc.stdout + proc.stderr).strip()}")
+        return False, "\n\n".join(errors)
+    except FileNotFoundError as exc:          # no patch/git on PATH at all
+        return False, f"no patch tool available: {exc}"
+    finally:
+        shutil.rmtree(work, ignore_errors=True)
+
+
 def write_fix(hypothesis: dict, target_component: str, *,
-              client: LLMClient | None = None, root: str = ".") -> str:
+              client: LLMClient | None = None, root: str = ".",
+              max_attempts: int = 3) -> str:
     """Generate a code diff/patch (as text) implementing `hypothesis`.
 
     Parameters
@@ -76,5 +164,36 @@ def write_fix(hypothesis: dict, target_component: str, *,
 
     content = _read_root_file(file_name, root)
     user = prompts.build_writer_user(file_name, content, hypothesis, target_component)
-    raw = client.complete(system, user, kind=KIND_DIFF, max_tokens=4000, temperature=0.0)
-    return _extract_diff(raw)
+
+    # Validate-and-repair. The prompt asks for a full-file rewrite, which we diff
+    # locally; the retry is only worth spending because the message changes (the
+    # client runs at temperature 0) and carries the concrete rejection reason.
+    diff, err = "", ""
+    for attempt in range(1, max(1, max_attempts) + 1):
+        msg = user if attempt == 1 else \
+            user + prompts.build_diff_repair_suffix(file_name, err)
+        raw = client.complete(system, msg, kind=KIND_DIFF,
+                              max_tokens=16000, temperature=0.0)
+
+        block = _extract_python(raw)
+        if block is not None and not block.lstrip().startswith(("--- ", "diff --git")):
+            diff, err = rewrite_to_diff(block, content, file_name)
+        else:
+            # The model returned a patch anyway. Take it, but repair the hunk
+            # counts first — that alone is what turns "malformed patch" (whole
+            # patch rejected) into something applyable.
+            candidate = _extract_diff(raw)
+            diff, err = candidate, ""
+            if not diff_applies(candidate, file_name, root)[0]:
+                repaired = normalize_unified_diff(candidate, content)
+                if diff_applies(repaired, file_name, root)[0]:
+                    diff = repaired
+
+        if diff:
+            ok, apply_err = diff_applies(diff, file_name, root)
+            if ok:
+                return diff
+            err = err or apply_err
+    # Give up and return the last attempt: the caller's staging step will reject
+    # it and log the reason, which keeps the failure visible in progress.json.
+    return diff
