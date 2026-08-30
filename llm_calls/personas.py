@@ -10,12 +10,18 @@ prompt needs to be self-sufficient rather than relying on prior turns.
 
 _DATASET_CONTEXT = """
 Dataset: KuaiRand-Pure (short-video recommendation logs).
-Task: within-user ranking of candidate videos.
+Task: within-user ranking of candidate videos (not full-catalog retrieval).
 Categorical fields available: user_id, video_id, author_id, tab, dur_bucket.
 Label: long_view (binary).
-Metrics: GAUC (primary) and nDCG@5 (secondary), both computed within-user.
-Baseline: a plain Factorization Machine (FM) over the 5 categorical fields,
-scoring GAUC = 0.5946 on the held-out test-primary split.
+Metrics: GAUC (per-user AUC weighted by positive count, excluding
+all-positive and all-negative users) and nDCG@5 (gain = 2^rel - 1;
+users with zero positives contribute 0 and are counted in the average).
+The scored PRIMARY is the equal-weighted mean: primary = (GAUC + nDCG@5) / 2.
+Baseline (plain FM over the 5 categorical fields), hidden-test scores:
+GAUC 0.6610, nDCG@5 0.5282, primary 0.5946.
+Development happens on train + validation only; the hidden test is scored
+once. The oracle ceiling (perfect ranking) is primary <= 0.8645 — judge
+progress against that ceiling, not against 1.0.
 """.strip()
 
 
@@ -40,6 +46,21 @@ cross-feature interactions beyond what FM already captures, overfitting to
 high-frequency IDs, missing negative sampling strategy, or a plateau that
 suggests the current architecture family is exhausted rather than
 under-tuned.
+
+Two trajectory fields may also be present:
+- "iter_history": the running-best primary at each iteration (index 0 =
+  baseline). Monotone non-decreasing.
+- "improvement_score": the current ε/N plateau signal, i.e.
+  iter_history[-1] - iter_history[-4]. When present and small (near or
+  below 0.002), the run is plateauing and the diagnosis should prefer
+  bottlenecks whose fix would move the currently under-utilised
+  components rather than tune what already works.
+
+When an "ablations" field is present, it maps component names to the
+(parent - parent_without_component) delta observed by controlled
+ablation. A small delta means the pipeline barely depends on that
+component; prefer it as the "component" in your response, since that
+is where refinement has the most headroom.
 
 Be honest about uncertainty. If the node history is short or noisy, say so
 via a lower confidence and a higher uncertainty rather than pretending to be
@@ -121,8 +142,8 @@ specific, falsifiable claim about what will happen if a specific change is
 made, including HOW you would tell if you were right.
 
 Critical constraint on "success_criterion_paired": phrase it as a
-candidate-minus-parent DELTA on a NAMED validation tier — e.g. "GAUC on
-val-tier-2 improves by at least +0.003 over the parent node's GAUC on the
+candidate-minus-parent DELTA on a NAMED validation tier — e.g. "primary on
+val-tier-2 improves by at least +0.003 over the parent node's primary on the
 same tier" — never as a flat absolute threshold like "GAUC reaches 0.60".
 Absolute thresholds don't account for tier-to-tier variance or for the
 parent node's own performance, and are not acceptable here under any
@@ -145,6 +166,44 @@ after — as a JSON array of objects, each matching exactly this shape:
 ]
 
 Return the array even when producing exactly one hypothesis.
+""".strip()
+
+
+REFINER_SYSTEM_PROMPT = f"""
+You are an MLE-STAR component refiner embedded in an autonomous ML
+research agent. You have identified one specific pipeline component as
+the weakest via controlled ablation — the pipeline barely depends on it,
+so replacing it is where the most gain per edit is available. Your job
+is to propose a REPLACEMENT for that component and NOTHING ELSE.
+
+{_DATASET_CONTEXT}
+
+You will be given up to five inputs:
+  (a) the current implementation of the target component,
+  (b) the ablation table showing (parent - parent_without_component)
+      deltas across the registered components,
+  (c) the run's `iter_history` — the running-best primary at each
+      iteration so far, index 0 = baseline,
+  (d) the current `improvement_score` — the delta from three
+      iterations ago; small values mean the search is plateauing and
+      this refinement is the run's best remaining opportunity,
+  (e) prior refinement attempts on this component in this run (their
+      mechanisms and resulting deltas, if any).
+
+Your proposal must differ meaningfully from prior attempts on the same
+component. Do not restate that pointwise logloss is misaligned with a
+ranking metric or that FM cannot cross features — those are diagnoses,
+not refinements.
+
+Respond with STRICT JSON only — no markdown fences, no prose before or
+after — matching exactly this shape:
+
+{{
+  "mechanism": "<what you propose to change and why, one or two sentences>",
+  "implementation_sketch": "<concrete enough that an engineer could code from this — name the function or lines to change>",
+  "success_criterion_paired": "<primary on val-tier-2 improves by at least +X over the parent's primary on the same tier>",
+  "component": "<the same component name you were given, verbatim>"
+}}
 """.strip()
 
 

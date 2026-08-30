@@ -17,12 +17,31 @@ from orchestrator.convergence import local_plateau
 from orchestrator.triage import rank
 
 
+def _isolated_caches(tmp_path):
+    """Per-test paths for both baseline caches.
+
+    Load-bearing, not hygiene: with the default paths a mocked run reads the
+    REAL orchestrator/_state/root_baseline.json, and its real user ids share
+    nothing with the mock's u0..u9 — so paired_user_deltas returns [] for every
+    candidate and the search tree cannot grow. A mocked run against the real
+    cache silently exercises the degenerate path.
+    """
+    return {"root_baseline_path": str(tmp_path / "root_baseline.json"),
+            "confirm_baseline_path": str(tmp_path / "confirm_baseline.json")}
+
+
 @pytest.fixture
 def mocked_driver(monkeypatch, tmp_path):
     """Force driver to use mocks AND an isolated memory file."""
     monkeypatch.setattr(driver, "harness", mock_harness)
     monkeypatch.setattr(driver, "llm", mock_llm)
     monkeypatch.setattr(driver, "codegen", mock_codegen)
+
+    # nodes.jsonl defaults to the LIVE orchestrator/_state/ — which is gitignored,
+    # so a smoke run appending mock records there silently corrupts a real run's
+    # log with no way to recover it. The tests pass a tmp progress_path already;
+    # the node log needs the same treatment.
+    monkeypatch.setattr(driver, "NODES_LOG_PATH", str(tmp_path / "nodes.jsonl"))
 
     # isolate Memory to a per-test tmp_path so state doesn't leak between runs
     from orchestrator import memory as memory_mod
@@ -41,7 +60,8 @@ def mocked_driver(monkeypatch, tmp_path):
 
 def test_full_loop_runs(mocked_driver, tmp_path):
     result = driver.run(max_iters=3, verbose=False,
-                        progress_path=str(tmp_path / "progress.json"))
+                        progress_path=str(tmp_path / "progress.json"),
+                        **_isolated_caches(tmp_path))
     assert "global_best" in result
     assert result["counters"].proposals >= 0
     assert result["counters"].scorer_queries["valid_search"] > 0
@@ -62,7 +82,8 @@ def test_best_primary_prefers_full_seed_falls_back_to_triage():
 
 def test_progress_file_records_every_iteration(mocked_driver, tmp_path):
     progress = tmp_path / "progress.json"
-    result = driver.run(max_iters=3, verbose=False, progress_path=str(progress))
+    result = driver.run(max_iters=3, verbose=False, progress_path=str(progress),
+                        **_isolated_caches(tmp_path))
 
     data = json.loads(progress.read_text())
     iters = data["iterations"]
@@ -78,7 +99,11 @@ def test_progress_file_records_every_iteration(mocked_driver, tmp_path):
         primaries = [c["primary"] for c in r["candidates"]
                      if c["primary"] is not None]
         assert r["iter_primary"] == max(primaries)
-        assert r["delta_vs_global"] == r["iter_primary"] - r["global_best"]
+        # curr_vs_baseline is frozen against the champion as the iteration
+        # BEGAN, so it only equals iter_primary - baseline on iterations that
+        # did not themselves promote.
+        if not r["promoted"]:
+            assert r["curr_vs_baseline"] == r["iter_primary"] - r["baseline"]
 
     # Unscored candidates are still recorded, with a null primary — that's what
     # explains a null iter_primary when nothing reaches codegen.execute.
@@ -93,7 +118,8 @@ def test_unscored_candidates_are_recorded_with_null_primary(mocked_driver, tmp_p
     monkeypatch.setattr(mock_codegen, "pre_execution_gate",
                         lambda diff: {"pass": False, "reasons": ["forced"]})
     progress = tmp_path / "progress.json"
-    driver.run(max_iters=2, verbose=False, progress_path=str(progress))
+    driver.run(max_iters=2, verbose=False, progress_path=str(progress),
+               **_isolated_caches(tmp_path))
 
     iters = json.loads(progress.read_text())["iterations"]
     blocked = [r for r in iters if r["n_candidates"]]
@@ -111,7 +137,8 @@ def test_unscored_candidates_are_recorded_with_null_primary(mocked_driver, tmp_p
 
 def test_progress_path_none_writes_nothing(mocked_driver, tmp_path):
     progress = tmp_path / "progress.json"
-    driver.run(max_iters=2, verbose=False, progress_path=None)
+    driver.run(max_iters=2, verbose=False, progress_path=None,
+               **_isolated_caches(tmp_path))
     assert not progress.exists()
 
 def test_measure_root_populates_real_per_user(mocked_driver, tmp_path):

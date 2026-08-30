@@ -20,6 +20,8 @@ from __future__ import annotations
 import os, re, json
 
 from . import prompts
+from . import writer as _writer
+from .diffnorm import normalize_unified_diff
 from .constants import ORACLE_PRIMARY_CEILING
 from .llm_client import LLMClient, get_default_client, KIND_DEBUG, KIND_SANITY
 
@@ -61,6 +63,27 @@ def _extract_diff(text: str) -> str:
     return text.strip() + "\n"
 
 
+def _diff_from_raw(raw: str, content: str, fname: str,
+                   root: str) -> tuple[str, str]:
+    """Turn one model reply into (diff, rejection_reason).
+
+    Mirrors codegen.writer.write_fix's extract-then-diff pipeline, because
+    DEBUG_SYSTEM inherits the same _DIFF_FORMAT_RULES: the model is asked for a
+    COMPLETE ```python file, which we diff locally so the patch applies by
+    construction. The ```diff branch stays as a fallback for a model that emits
+    a patch anyway.
+    """
+    block = _writer._extract_python(raw)
+    if block is not None and not block.lstrip().startswith(("--- ", "diff --git")):
+        return _writer.rewrite_to_diff(block, content, fname)
+    candidate = _extract_diff(raw)
+    if candidate.strip() and not _writer.diff_applies(candidate, fname, root)[0]:
+        repaired = normalize_unified_diff(candidate, content)
+        if _writer.diff_applies(repaired, fname, root)[0]:
+            return repaired, ""
+    return candidate, ""
+
+
 def _looks_implausible(observed_score: float, history, threshold) -> bool:
     if observed_score is None:
         return False
@@ -79,7 +102,7 @@ def _looks_implausible(observed_score: float, history, threshold) -> bool:
 
 
 def debug_and_retry(code_path: str, error_context: str, *,
-                    client: LLMClient | None = None, root: str = ".",
+                    client: LLMClient | None = None, root: str | None = None,
                     file_name: str | None = None,
                     observed_score: float | None = None,
                     history: list | None = None,
@@ -90,7 +113,8 @@ def debug_and_retry(code_path: str, error_context: str, *,
 
     The frozen 2-argument form debug_and_retry(code_path, error_context) works;
     the keyword args enable the sanity-check path and let the orchestrator inject
-    a real client.
+    a real client. `root` is where the repair diff is validated; it defaults to
+    code_path's own directory.
 
     Returns at least {"code_diff": str, "is_semantic_change": bool}. When the
     sanity path runs, also includes {"sanity": {...}, "leak_suspected": bool}.
@@ -98,18 +122,32 @@ def debug_and_retry(code_path: str, error_context: str, *,
     client = client or get_default_client()
     fname = file_name or os.path.basename(code_path)
     content = _read(code_path)
+    # The diff must apply to the file being REPAIRED, so validation defaults to
+    # that file's own directory. A literal "." default validated a staged
+    # candidate's repair against the pristine repo copy instead — silently the
+    # wrong file whenever code_path lives outside the repo root.
+    root = root if root is not None else (os.path.dirname(code_path) or ".")
 
     # ---- repair loop (up to max_retries) --------------------------------- #
+    # A repair diff is only worth returning if it APPLIES — the driver applies it
+    # to the staged dir before rerunning, so an unapplyable diff means the rerun
+    # would re-execute the same broken code. Each retry carries the concrete
+    # rejection reason, which is what makes it worth spending at temperature 0.
     code_diff = ""
-    last_err = error_context
-    for _ in range(max(1, max_retries)):
-        user = prompts.build_debug_user(fname, content, last_err)
-        raw = client.complete(prompts.DEBUG_SYSTEM, user, kind=KIND_DEBUG,
-                              max_tokens=2000, temperature=0.0)
-        code_diff = _extract_diff(raw)
-        if code_diff.strip():
-            break
-        last_err = error_context + "\n(previous attempt returned an empty diff)"
+    user = prompts.build_debug_user(fname, content, error_context)
+    err = ""
+    for attempt in range(1, max(1, max_retries) + 1):
+        msg = user if attempt == 1 else \
+            user + prompts.build_diff_repair_suffix(fname, err or "empty diff")
+        raw = client.complete(prompts.DEBUG_SYSTEM, msg, kind=KIND_DEBUG,
+                              max_tokens=16000, temperature=0.0)
+        diff, err = _diff_from_raw(raw, content, fname, root)
+        if diff.strip():
+            ok, apply_err = _writer.diff_applies(diff, fname, root)
+            if ok:
+                code_diff = diff
+                break
+            err = err or apply_err
 
     result = {"code_diff": code_diff, "is_semantic_change": is_semantic_change(code_diff)}
 

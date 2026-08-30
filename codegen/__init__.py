@@ -14,7 +14,9 @@ All model-calling functions accept an optional `client=` (see llm_client) and ru
 offline via a deterministic fake backend unless a real backend is configured, so
 the package is fully testable with no API key and no teammate module.
 """
-from .writer import write_fix
+from .writer import (write_fix, write_refine, changes_executable_code,
+                     NO_SEMANTIC_CHANGE)
+from .ablations import ABLATIONS, Ablation
 from .gate import pre_execution_gate
 from .sandbox import execute
 from .debug import debug_and_retry, is_semantic_change
@@ -25,7 +27,9 @@ from .constants import (NON_CAUSAL_COLUMNS, AUXILIARY_SIGNALS,
                         ORACLE_PRIMARY_CEILING, FM_BASELINE_TEST_PRIMARY)
 
 __all__ = [
-    "write_fix", "pre_execution_gate", "execute", "debug_and_retry",
+    "write_fix", "write_refine", "changes_executable_code",
+    "NO_SEMANTIC_CHANGE", "ABLATIONS", "Ablation",
+    "pre_execution_gate", "execute", "debug_and_retry",
     "is_semantic_change", "check_submission", "synthesize_report",
     "LLMClient", "FakeBackend", "OpenAIBackend", "get_default_client",
     "NON_CAUSAL_COLUMNS", "AUXILIARY_SIGNALS",
