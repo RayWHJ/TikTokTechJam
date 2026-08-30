@@ -13,6 +13,50 @@ SPLITS = {'train': (20220408, 20220421),
 # 5 个特征域。想加特征就往这里加 —— 这是学生最该动的地方之一。
 FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
 
+#: 'train' re-cut by date into the rows a model FITS on and the rows it
+#: EARLY-STOPS on. These two partition SPLITS['train'] exactly; 'train' itself
+#: stays defined over the full range, because encode()'s vocabularies and
+#: _bucket_edges are built from splits['train'] and building them from train_fit
+#: alone would push two days' worth of ids into the per-field UNK slot.
+#:
+#: Why this exists. run_fm early-stops on `select_on` and then reports the
+#: metric on `report_on`, and the orchestrator passed valid_search for both. The
+#: stopping epoch is chosen by maximising primary on those exact rows
+#: (patience=4, epochs=40), so a candidate that happens to train more epochs
+#: gets more draws at the maximum on the split it is scored on, and scores
+#: higher for a reason that has nothing to do with its mechanism. The paired
+#: bootstrap cannot see it, because it compares only final per-user scores.
+#: MEASURED, 3 seeds each, root primary on valid_search:
+#:   fit 14d, stop on valid_search, report valid_search   0.5946398  (old)
+#:   fit 12d, stop on valid_search, report valid_search   0.5940682
+#:   fit 12d, stop on train_es,     report valid_search   0.5935765  (new)
+#: So the two effects separate cleanly: -0.00057 is the real cost of fitting on
+#: 12 days instead of 14, and -0.00049 is the optimistic bias this change
+#: removes. That second number is 0.83x the largest candidate-minus-parent delta
+#: the search has ever measured (+0.000593, iteration 1 of the run in
+#: orchestrator/_state/progress.json) — so most of that "gain" was plausibly the
+#: candidate training more epochs, not its mechanism. The new number is lower
+#: and comparable across candidates; the old one was higher and was not.
+#:
+#: train_es is the two days immediately before 'valid' starts, so it is genuinely
+#: held out from fitting while staying temporally adjacent to the rows the model
+#: trained on — which is what makes it a fair stopping signal for a split that
+#: comes later still.
+TRAIN_SUBSPLITS = {'train_fit': (20220408, 20220419),
+                   'train_es':  (20220420, 20220421)}
+
+
+def cut_train_subsplits(splits):
+    """Add train_fit / train_es, re-cut from 'train' by date.
+
+    Mirrors baseline.py::cut_valid_subsplits. Returns a new dict; 'train' is
+    left in place untouched, since encode() reads it for the vocabulary.
+    """
+    out = dict(splits)
+    for name, (lo, hi) in TRAIN_SUBSPLITS.items():
+        out[name] = [x for x in splits['train'] if lo <= x[0] <= hi]
+    return out
+
 def load(data_dir):
     """读日志 + 视频侧特征，返回按划分切好的 dict。"""
     vid2author = {}

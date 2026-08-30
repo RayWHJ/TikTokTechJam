@@ -6,7 +6,7 @@
 """
 import argparse, collections, json, os, time
 import numpy as np
-from data import load, encode, encode_lgb, FIELDS
+from data import load, encode, encode_lgb, cut_train_subsplits, FIELDS
 from evaluate import evaluate
 
 def sigmoid(x): return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
@@ -122,15 +122,28 @@ class FM:
         return np.concatenate([self.logits(X[i:i + bs])[0] for i in range(0, len(X), bs)])
 
 def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbose=True,
-           select_on='valid', report_on=('valid', 'test'), return_preds=False):
-    """Train an FM, early-stopping on `select_on`, and score every `report_on` split.
+           train_on='train', select_on='valid', report_on=('valid', 'test'),
+           return_preds=False):
+    """Train an FM on `train_on`, early-stopping on `select_on`, and score every
+    `report_on` split.
 
-    The defaults reproduce the original valid/test behaviour exactly. The
-    orchestrator passes select_on='valid_search' so that model selection never
-    touches valid_confirm, which stays a clean held-out check for promotion.
+    The defaults reproduce the original valid/test behaviour exactly, so the
+    ladder published in README.md and baseline_scores.json is unaffected.
+
+    The orchestrator passes train_on='train_fit', select_on='train_es' instead.
+    It used to pass select_on='valid_search' while also reporting on
+    valid_search, which early-stops on the very rows it is scored on: the
+    stopping epoch maximises primary on those rows, so a candidate that trains
+    more epochs collects more draws at the maximum and scores higher for a
+    reason unrelated to its mechanism. See data.TRAIN_SUBSPLITS for the full
+    argument and the numbers.
+
+    `train_on` defaults to 'train' rather than 'train_fit' deliberately: the
+    interactive `python3 baseline.py --model fm` path must keep training on all
+    14 days, or the published numbers stop being reproducible.
     """
     enc, dim = encode(splits)
-    Xtr, ytr, _ = enc['train']; Xsel, ysel, usel = enc[select_on]
+    Xtr, ytr, _ = enc[train_on]; Xsel, ysel, usel = enc[select_on]
     m = FM(dim, k=k, lr=lr, seed=seed)
     rng = np.random.default_rng(seed)
     best, best_state, bad = -1, None, 0
@@ -305,15 +318,32 @@ def run_for_orchestrator(a, split):
     if model not in _ORCHESTRATOR_RUNNERS:
         raise SystemExit(f"CODEGEN_SPLIT set but model={model!r}; orchestrator "
                          f"mode supports {sorted(_ORCHESTRATOR_RUNNERS)} only.")
-    splits = cut_valid_subsplits(load(a.data_dir))
+    splits = cut_train_subsplits(cut_valid_subsplits(load(a.data_dir)))
     if split not in splits:
         raise SystemExit(f"unknown CODEGEN_SPLIT {split!r}; expected one of "
                          f"{sorted(VALID_SUBSPLITS)}")
-    # Always select on valid_search, so scoring valid_confirm stays uncontaminated.
-    kw = ({'k': a.k, 'lr': a.lr, 'epochs': a.epochs} if model == 'fm' else {})
+    if model == 'fm':
+        # Fit on train_fit, early-stop on train_es, report on `split`. Three
+        # DISJOINT date ranges, which is the point: the previous call passed
+        # select_on='valid_search' while report_on was also valid_search, so the
+        # stopping epoch was chosen by maximising the very metric being
+        # reported. A candidate training more epochs then scored higher for a
+        # reason unrelated to its mechanism, invisibly to the paired bootstrap.
+        # See data.TRAIN_SUBSPLITS.
+        kw = {'k': a.k, 'lr': a.lr, 'epochs': a.epochs,
+              'train_on': 'train_fit', 'select_on': 'train_es'}
+    else:
+        # run_lgb keeps the old protocol. Not an oversight: it is not the
+        # orchestrator default (see ORCHESTRATOR_DEFAULT_MODEL) and its
+        # early-stopping runs through LightGBM's own callback over encode_lgb's
+        # aggregate features, which are themselves train-only statistics — a
+        # different change with a different blast radius. Deltas are always
+        # candidate-vs-parent within one model, so the two protocols never get
+        # compared against each other. Selecting on valid_search keeps
+        # valid_confirm uncontaminated, which was the original reason for it.
+        kw = {'select_on': 'valid_search'}
     res, preds = _ORCHESTRATOR_RUNNERS[model](
-        splits, seed=a.seed, select_on='valid_search', report_on=(split,),
-        return_preds=True, **kw)
+        splits, seed=a.seed, report_on=(split,), return_preds=True, **kw)
     users, labels, scores = preds[split]
     # evaluate() is fed numpy predictions here, so its aggregates come back as
     # np.float32 — not JSON-serializable. Coerce to plain Python numbers.
