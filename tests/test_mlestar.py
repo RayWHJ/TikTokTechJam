@@ -19,7 +19,7 @@ import pytest
 
 from llm_calls import personas
 from llm_calls.refine import _build_prompt as build_refine_prompt
-from orchestrator import ablation_harness, convergence, driver
+from orchestrator import ablation_harness, driver
 from orchestrator.ablation_harness import (pick_weakest_component,
                                            run_ablations)
 from orchestrator.mocks import codegen as mock_codegen
@@ -287,19 +287,18 @@ def _refine_nodes(nodes):
     return [n for n in nodes if n["operation"] == "refine"]
 
 
-def _tighter_stop_bar(epsilon):
-    """A stricter plateau STOP, so a plateau REFINE trigger can be observed.
-
-    The stop condition and the refine trigger now read the same signal.
-    iter_history is monotone (running best), so local_plateau's
-    max(h[-3:]) - max(h[:-3]) reduces to exactly h[-1] - h[-4] — the quantity
-    _refine_triggers compares against PLATEAU_REFINE_THRESHOLD. Since the stop
-    bar (ε=0.002) is looser than that threshold (0.001) AND is evaluated at the
-    end of the previous iteration, the stop always pre-empts the trigger in a
-    real run — see test_plateau_stop_preempts_plateau_refine_trigger, which
-    pins that interaction. Tightening ε isolates the trigger under test.
-    """
-    return lambda hist: convergence.local_plateau(hist, epsilon=epsilon)
+#: No plateau-stop workaround here any more, deliberately.
+#:
+#: These tests used to monkeypatch driver.local_plateau with a tightened ε,
+#: because the driver called it with convergence.local_plateau's own defaults
+#: (ε=0.002, N=3) — looser than PLATEAU_REFINE_THRESHOLD (0.001) and evaluated
+#: at the end of the previous iteration, so the stop always pre-empted the
+#: trigger and a plateau refine could never be observed in a real run.
+#:
+#: driver.PLATEAU_STOP_EPSILON (0.0005) / PLATEAU_STOP_WINDOW_N (8) now provide
+#: that ordering in the driver itself, so the tests below exercise the real
+#: calibration instead of a fake one. See
+#: tests/test_refine_trap_fixes.py::test_plateau_stop_bar_is_below_the_refine_trigger.
 
 
 def test_cadence_trigger_fires_after_k_improves(monkeypatch, tmp_path):
@@ -327,7 +326,6 @@ def test_cadence_trigger_fires_after_k_improves(monkeypatch, tmp_path):
 def test_plateau_trigger_fires_below_threshold(monkeypatch, tmp_path):
     """Cadence disabled, so only the plateau trigger can fire."""
     monkeypatch.setattr(driver, "REFINE_EVERY_K_IMPROVES", 10 ** 6)
-    monkeypatch.setattr(driver, "local_plateau", _tighter_stop_bar(0.0005))
     # Running best after 3 iterations is 0.5954, so the ε/N window at the top
     # of iteration 4 is 0.5954 - 0.5946 = 0.0008 <= PLATEAU_REFINE_THRESHOLD.
     # 0.0008 is also above REFINE_TARGET_MIN_IMPROVEMENT (0.0005), so the
@@ -345,7 +343,6 @@ def test_plateau_trigger_fires_below_threshold(monkeypatch, tmp_path):
 
 def test_refine_node_carries_improvement_score_in_diagnosis(monkeypatch, tmp_path):
     monkeypatch.setattr(driver, "REFINE_EVERY_K_IMPROVES", 10 ** 6)
-    monkeypatch.setattr(driver, "local_plateau", _tighter_stop_bar(0.0005))
     _progress, nodes = _run(monkeypatch, tmp_path,
                             [0.5954, 0.59535, 0.59532, 0.5990])
     refine_node = _refine_nodes(nodes)[0]

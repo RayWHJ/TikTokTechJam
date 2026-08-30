@@ -22,6 +22,52 @@ GAUC 0.6610, nDCG@5 0.5282, primary 0.5946.
 Development happens on train + validation only; the hidden test is scored
 once. The oracle ceiling (perfect ranking) is primary <= 0.8645 — judge
 progress against that ceiling, not against 1.0.
+
+IMPLEMENTATION BUDGET — a proposal that does not fit this is worthless, no
+matter how good the idea is. Half of all candidates so far failed to produce
+runnable code because they ignored these limits:
+- Available libraries: numpy and lightgbm. NOTHING ELSE. There is no torch,
+  no tensorflow, no sklearn, no pandas, no transformers. Do not propose SAM,
+  ASAM, NAS, attention layers, state-space models, LLM-based augmentation, or
+  anything phrased as "using known deep learning libraries" — none of it can
+  be written here.
+- The change is a single-file edit to either data.py (features) or
+  baseline.py (model/loss/training), reproduced in full. Not both files.
+- One CPU core, single-threaded. The unmodified baseline trains and scores in
+  18 seconds; a candidate is killed at 240 seconds. Roughly 13x the baseline's
+  cost is the entire budget, so an O(users x items) or per-row-Python-loop
+  mechanism will simply time out.
+- No external data, no pretrained weights, no downloads.
+
+MODELS ALREADY IN THE REPO:
+- run_fm in baseline.py — the champion. Numpy FM, k=16, Adam, pointwise
+  logloss over the 5 categorical fields. test primary 0.5953.
+- run_lgb in baseline.py — LightGBM over dense train-only aggregate features
+  (smoothed video/author/user long_view rates, exposure counts, duration, tab,
+  and a video x user-activity-decile cross). Supports lambdarank and binary.
+
+MEASURED DEAD ENDS — do not re-propose these, they are already refuted here:
+- Adding more static categorical feature domains to the FM: 0.5940 vs 0.5950
+  for 5 fields. No effect.
+- FM embedding dimension k = 8 / 16 / 32: 0.5895 / 0.5902 / 0.5887. Capacity
+  is not the bottleneck.
+- Replacing the FM with a GBDT over train-only count aggregates: 0.5755
+  (lambdarank), 0.5795 (small capacity), 0.5800 (binary), 0.5797 (binary plus
+  an out-of-fold FM score as a feature). All well below the FM's 0.5953.
+  WHY, because it generalises: (a) a user x author pair occurs 1.07 times in
+  train on average, so per-pair target encoding is one observation of noise —
+  the FM's embeddings share statistical strength across users, count features
+  cannot; (b) in the stacked model the largest feature gain by 2x was
+  `user_rate`, which is CONSTANT WITHIN A USER and therefore cannot change a
+  within-user ranking at all. Any mechanism whose signal is constant within a
+  user contributes exactly zero to this metric.
+
+STILL UNEXPLORED, in the starter kit's own order of promise: a pairwise (BPR)
+or listwise (within-user softmax) loss for the FM, so the objective matches
+the ranking metric; user behaviour SEQUENCE features, which nothing in the
+repo uses yet; multi-task auxiliary loss targets (is_click, is_like,
+play_time_ms are permitted as TARGETS, never as inputs); censored regression
+on watch time; and the random-exposure log as an unbiased validation check.
 """.strip()
 
 

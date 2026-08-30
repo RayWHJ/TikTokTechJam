@@ -41,20 +41,50 @@ OUTPUT FORMAT — return the COMPLETE updated file, not a diff:
 8. Keep the change minimal: the output should differ from the input only where
    the mechanism requires it."""
 
+# The runtime the generated code has to survive. Stated to the writer because
+# half of the first run's candidates never produced runnable code — they were
+# written against libraries that are not installed, or a cost budget the sandbox
+# kills. Kept in sync with llm_calls/personas.py's _DATASET_CONTEXT.
+_RUNTIME_RULES = """\
+RUNTIME — code that violates this is killed before it scores:
+- Importable: numpy and lightgbm. NOTHING else. No torch, tensorflow, sklearn,
+  pandas or transformers — they are not installed and an ImportError wastes the
+  whole candidate.
+- One CPU core, single-threaded. The unmodified baseline runs in 18s; the
+  sandbox kills a candidate at 240s. Vectorise with numpy — a per-row Python
+  loop over the 1.14M training rows will not finish.
+- Determinism matters: the search compares candidates at ~0.001, so seed
+  anything stochastic from the --seed argument."""
+
 WRITER_SYSTEM_MODEL = f"""\
-You are a precise ML systems engineer editing a numpy Factorization Machine.
+You are a precise ML systems engineer editing baseline.py, which holds TWO
+models: run_fm (a numpy Factorization Machine, the current champion at 0.5953
+test primary) and run_lgb (a LightGBM ranker over dense train-only aggregate
+features). Edit whichever the mechanism concerns; run_fm unless told otherwise.
 You modify ONLY baseline.py's model / loss / training loop. You do not touch
 data.py's feature encoding, evaluate.py, or submit.py. Keep the change minimal
-and self-contained; preserve the public run/predict interface so the harness can
-still score outputs.
+and self-contained; preserve the public run/predict interface and the
+`##CODEGEN_METRICS##` output line so the harness can still score outputs.
+{_RUNTIME_RULES}
 {_SAFETY_RULES}
 {_DIFF_FORMAT_RULES}"""
 
 WRITER_SYSTEM_DATA = f"""\
-You are a precise ML feature engineer editing data.py's feature encoding for a
-numpy Factorization Machine. You modify ONLY data.py (the FIELDS list and the
-encode()/raw() logic). You do not change the model or loss. Any new feature must
-be derivable from columns known at serving time for that row.
+You are a precise ML feature engineer editing data.py's feature encoding. It
+holds TWO encoders: encode() (the FIELDS list plus encode()/raw(), feeding the
+numpy FM) and encode_lgb() (dense train-only aggregate features feeding the
+LightGBM ranker). Edit whichever the mechanism concerns. You modify ONLY
+data.py; you do not change the model or loss.
+
+Any new feature must be derivable from columns known at serving time for that
+row, and every aggregate statistic must be computed on the TRAIN split only and
+then looked up for valid/test — train is strictly earlier in time, which is what
+makes that safe.
+
+A feature that is CONSTANT WITHIN A USER contributes exactly zero to this
+metric, because the ranking is done inside each user. Pure user-side features
+are only useful through an interaction with an item-side value.
+{_RUNTIME_RULES}
 {_SAFETY_RULES}
 {_DIFF_FORMAT_RULES}"""
 

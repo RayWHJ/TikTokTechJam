@@ -14,7 +14,7 @@ import random
 
 import pytest
 
-from orchestrator import ablation_harness, convergence, driver
+from orchestrator import ablation_harness, driver
 from orchestrator.ablation_harness import pick_weakest_component
 from orchestrator.mocks import codegen as mock_codegen
 from orchestrator.mocks import harness as mock_harness
@@ -229,62 +229,70 @@ def test_local_plateau_call_uses_iter_history(monkeypatch, tmp_path):
     N+1 length guard makes local_plateau structurally False and this run
     would burn all seven iterations.
     """
-    flat_tail = [0.60, 0.62, 0.64, 0.6401, 0.6402, 0.6403, 0.6404]
+    # Tail entries sit BELOW the 0.64 peak, so the running best is genuinely
+    # flat rather than creeping. The old version crept +0.0001 per iteration,
+    # which clears driver.PLATEAU_STOP_EPSILON=0.0005 over an 8-wide window.
+    flat_tail = [0.60, 0.62, 0.64] + [0.6395] * 9
     progress, _ = _run(monkeypatch, tmp_path, flat_tail)
 
     assert progress["history"] == [pytest.approx(BASE)], \
         "no promotion — so `history` could never have driven this stop"
-    # Running best goes B, .60, .62, .64, .64, .64, .64. The ε/N window first
-    # closes at the end of iteration 6: max(last 3) - max(the rest) = 0.0003.
-    assert progress["iters_completed"] == 6
-    assert len(progress["iter_history"]) == 7   # baseline + 6 iterations
+    # Running best goes B, .60, .62, .64, then .64 forever. With N=8 the window
+    # only closes once the 0.64 peak has fallen out of max(h[-8:]) and into
+    # max(h[:-8]) — that is len(iter_history) == 12, i.e. the end of iteration 11.
+    assert progress["iters_completed"] == 11
+    assert len(progress["iter_history"]) == 12   # baseline + 11 iterations
 
 
 def test_plateau_stop_fires_on_a_flat_run_from_the_start(monkeypatch, tmp_path):
     """The diagnosed run's shape: nothing beats baseline, ever."""
     progress, _ = _run(monkeypatch, tmp_path, [BASE] * 20, max_iters=20)
-    # First check is at the end of iteration 3, when iter_history reaches N+1.
-    assert progress["iters_completed"] == 3
+    # First check is at the end of iteration 8, when iter_history reaches
+    # driver.PLATEAU_STOP_WINDOW_N + 1.
+    assert progress["iters_completed"] == 8
 
 
-def test_plateau_stop_preempts_the_plateau_refine_trigger(monkeypatch, tmp_path):
-    """Documents an interaction Fix 1 creates, so it cannot regress silently.
-
-    Both the stop and the refine trigger now read iter_history, which is
-    monotone, so both reduce to iter_history[-1] - iter_history[-4]. The stop
-    bar (local_plateau's ε=0.002) is LOOSER than PLATEAU_REFINE_THRESHOLD
-    (0.001) and is evaluated at the end of the previous iteration — so any
-    trajectory flat enough to arm the plateau refine trigger has already
-    stopped the run. With cadence disabled, no refine can fire at all.
-
-    If PLATEAU_REFINE_THRESHOLD is ever raised above ε, or the stop is given
-    its own ε, this test and its twin below are what should be revisited.
-    """
-    monkeypatch.setattr(driver, "REFINE_EVERY_K_IMPROVES", 10 ** 6)
-    progress, nodes = _run(monkeypatch, tmp_path,
-                           [0.5954, 0.59535, 0.59532, 0.5990])
-    assert progress["iters_completed"] == 3, \
-        "the stop bar should have closed the run before iteration 4"
-    assert _refine_nodes(nodes) == []
-
-
-def test_plateau_refine_trigger_fires_when_the_stop_bar_is_tightened(
+def test_plateau_stop_no_longer_preempts_the_plateau_refine_trigger(
         monkeypatch, tmp_path):
-    """The twin of the test above: the trigger itself is still correct.
+    """The stop bar now sits BELOW the refine trigger, so refine is reachable.
 
-    Same trajectory, but with a stop ε below the refine threshold so
-    iteration 4 is actually reached. Running best after 3 iterations is
-    0.5954 — an improvement_score of 0.0008, at or under
-    PLATEAU_REFINE_THRESHOLD and over REFINE_TARGET_MIN_IMPROVEMENT, so the
-    trigger arms and the plateaued node is an eligible target.
+    Both the stop and the refine trigger read iter_history, which is monotone,
+    so both reduce to iter_history[-1] - iter_history[-4]. This test used to
+    assert the opposite of what it asserts now: with local_plateau's own
+    ε=0.002 the stop bar was LOOSER than PLATEAU_REFINE_THRESHOLD (0.001) and
+    was evaluated at the end of the previous iteration, so every trajectory
+    flat enough to arm the plateau refine trigger had already killed the run
+    and no refine could ever fire.
+
+    driver.PLATEAU_STOP_EPSILON (0.0005) is now below that threshold and
+    driver.PLATEAU_STOP_WINDOW_N (8) makes iteration 3 too early to check at
+    all, so the trigger arms first. Running best after 3 iterations is 0.5954,
+    an improvement_score of 0.0008 — at or under PLATEAU_REFINE_THRESHOLD and
+    over REFINE_TARGET_MIN_IMPROVEMENT, so the plateaued node is an eligible
+    target and iteration 4 refines it.
+
+    If PLATEAU_STOP_EPSILON is ever raised back above PLATEAU_REFINE_THRESHOLD,
+    this is the test that should fail.
     """
     monkeypatch.setattr(driver, "REFINE_EVERY_K_IMPROVES", 10 ** 6)
-    monkeypatch.setattr(driver, "local_plateau",
-                        lambda h: convergence.local_plateau(h, epsilon=0.0005))
     progress, nodes = _run(monkeypatch, tmp_path,
                            [0.5954, 0.59535, 0.59532, 0.5990])
-    assert progress["iters_completed"] == 4
+    assert progress["iters_completed"] == 4, \
+        "the stop bar must no longer close the run before iteration 4"
     assert [n["iter"] for n in _refine_nodes(nodes)] == [4]
+
+
+def test_plateau_stop_bar_is_below_the_refine_trigger(monkeypatch, tmp_path):
+    """The ordering the test above depends on, asserted directly.
+
+    Cheaper and more legible than inferring it from an iteration count: if
+    these two constants ever cross again, the plateau refine path becomes
+    dead code and only this line says so.
+    """
+    assert driver.PLATEAU_STOP_EPSILON < driver.PLATEAU_REFINE_THRESHOLD
+    # And the window has to be wide enough that h[-1] - h[-4] (the trigger's
+    # own window) can be evaluated before the stop's window closes at all.
+    assert driver.PLATEAU_STOP_WINDOW_N > 3
 
 
 # --------------------------------------------------------------------------- #
@@ -294,7 +302,9 @@ def test_run_does_not_refine_the_root_when_nothing_beats_baseline(
         monkeypatch, tmp_path):
     """Cadence comes due but open_nodes holds only the pristine root."""
     monkeypatch.setattr(driver, "PLATEAU_REFINE_THRESHOLD", float("-inf"))
-    monkeypatch.setattr(driver, "local_plateau", lambda h: False)
+    # No local_plateau stub needed: this run is 6 iterations, and
+    # driver.PLATEAU_STOP_WINDOW_N (8) means iter_history never reaches the N+1
+    # length the stop requires. The stub used to be load-bearing at N=3.
     # Every candidate scores exactly baseline, so none clears
     # should_continue_locally and the root stays the only open node.
     progress, nodes = _run(monkeypatch, tmp_path, [BASE] * 6, max_iters=6)

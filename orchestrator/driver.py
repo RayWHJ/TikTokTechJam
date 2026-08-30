@@ -90,6 +90,47 @@ NOOP_EPSILON = 1e-9
 # first didn't.
 MAX_FIX_ATTEMPTS = 2
 
+# Wall-clock cap for the 1-seed triage run. The unmodified baseline trains and
+# scores valid_search in 18s measured on this machine (early-stopping at epoch
+# 11 at ~1.1s/epoch), so the old 120s was only 6.7x the baseline — enough to
+# kill any candidate that trains more epochs, runs a second backward pass
+# (pairwise/listwise losses do), or adds a per-user aggregation. A correct but
+# 8x-slower mechanism was being recorded as a failed implementation and its
+# hypothesis thrown away. 240s is 13x the baseline and still well under the
+# 600s full-seed cap, so a candidate that clears triage cannot then time out
+# on seeds 1 and 2.
+TRIAGE_WALLCLOCK_CAP_S = 240
+
+# Plateau stop calibration. Deliberately NOT convergence.local_plateau's own
+# defaults (ε=0.002, N=3), which are unreachable on this task.
+#
+# iter_history is a MONOTONE running best, so local_plateau's
+# `max(h[-N:]) - max(h[:-N])` collapses to exactly `h[-1] - h[-4]` at N=3. The
+# rule therefore demands a BRAND-NEW >0.002 jump in the running best every three
+# iterations, forever — a gain can never count twice, because three iterations
+# later it is itself the `h[-4]` being subtracted. Against a baseline whose
+# 5-seed std is 0.0008 and a search whose largest single-candidate gain ever is
+# +0.0031, that bar cannot be held: the 4-iteration run cleared the iteration-3
+# check by 8.8e-6 and then stopped with the window delta at exactly 0.0, having
+# used 28 minutes of a 6-hour budget.
+#
+# ε=0.0005 sits below the 0.0008 seed std, so the rule now reads "no improvement
+# larger than measurement noise". N=8 widens the window so a branch gets several
+# iterations to pay off before the run is judged, and moves the earliest possible
+# stop from iteration 3 to iteration 8.
+#
+# Note this inverts the relationship with PLATEAU_REFINE_THRESHOLD (0.001): the
+# stop bar is now BELOW the refine trigger, so a plateauing run reaches an
+# ablation-guided refine instead of being killed before it. That was the intent
+# all along — tests/test_mlestar.py::_tighter_stop_bar and
+# tests/test_refine_trap_fixes.py both had to monkeypatch ε=0.0005 to observe it.
+#
+# Kept as driver constants rather than changed in convergence.py because
+# local_plateau is a generic utility whose defaults
+# orchestrator/tests/test_smoke.py::test_local_plateau_rule pins directly.
+PLATEAU_STOP_EPSILON = 0.0005
+PLATEAU_STOP_WINDOW_N = 8
+
 # Phase 2 (MLE-STAR ablation-guided refinement) kill switch.
 #
 # OFF: the search measurably regressed once refine was in the loop, so the
@@ -945,7 +986,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
 
             # 3a. Triage run — one seed, short cap.
             res = codegen.execute(c.code_path, seed=0, split="valid_search",
-                                  wallclock_cap_seconds=120,
+                                  wallclock_cap_seconds=TRIAGE_WALLCLOCK_CAP_S,
                                   root=cand_dir, data_dir=DATA_DIR)
             counters.bump("triage_runs")
             counters.bump_scorer("valid_search")
@@ -968,10 +1009,20 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                     # only empty hunks.
                     break
                 res = codegen.execute(c.code_path, seed=0, split="valid_search",
-                                      wallclock_cap_seconds=120,
+                                      wallclock_cap_seconds=TRIAGE_WALLCLOCK_CAP_S,
                                       root=cand_dir, data_dir=DATA_DIR)
                 counters.bump("triage_runs")
                 counters.bump_scorer("valid_search")
+            if res["status"] == "timeout":
+                # Distinct from "exec": the code was syntactically fine and ran,
+                # it just did not finish inside the cap. That calls for a cheaper
+                # implementation of the SAME mechanism (fewer epochs, vectorised
+                # inner loop), not for abandoning the hypothesis — so it must not
+                # be filed as a failed implementation.
+                if verbose:
+                    print(f"  {c.id} timed out at {TRIAGE_WALLCLOCK_CAP_S}s "
+                          f"(after {c.fix_attempts} repair attempt(s))")
+                return "timeout"
             if res["status"] != "ok":
                 return "exec"
 
@@ -986,7 +1037,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         _ATTEMPT_EVIDENCE = {"dedup": "refuted_under_context",
                              "gate": "failed_implementation",
                              "patch": "failed_implementation",
-                             "exec": "failed_implementation"}
+                             "exec": "failed_implementation",
+                             # Ran, but not inside TRIAGE_WALLCLOCK_CAP_S. Its own
+                             # type so the per-iteration tally in
+                             # _record_iteration distinguishes "the writer can't
+                             # implement this" from "this is too slow to measure",
+                             # which need opposite responses.
+                             "timeout": "timeout"}
 
         for c in candidates:
             outcome = _attempt(c)
@@ -1108,9 +1165,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         # is almost always shorter than local_plateau()'s N+1 minimum and the
         # stop condition never fires. iter_history is the per-iteration
         # running-best trajectory the plateau rule is defined against.
-        if local_plateau(iter_history):
+        if local_plateau(iter_history, epsilon=PLATEAU_STOP_EPSILON,
+                         N=PLATEAU_STOP_WINDOW_N):
             if verbose:
-                print(f"[stop] local plateau at iter {it}")
+                print(f"[stop] local plateau at iter {it} "
+                      f"(no gain > {PLATEAU_STOP_EPSILON} across the last "
+                      f"{PLATEAU_STOP_WINDOW_N} iterations)")
             break
 
     counters.wallclock_s = time.time() - t_start

@@ -6,7 +6,7 @@
 """
 import argparse, collections, json, os, time
 import numpy as np
-from data import load, encode, FIELDS
+from data import load, encode, encode_lgb, FIELDS
 from evaluate import evaluate
 
 def sigmoid(x): return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
@@ -158,22 +158,162 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbo
         preds[name] = (u, y, s)
     return (out, preds) if return_preds else out
 
+# ---------------- LightGBM LambdaRank ----------------
+# Why this exists alongside the FM: the metric is a RANKING metric (GAUC and
+# nDCG@5) but the FM trains pointwise logloss, which the starter-kit README
+# names as the single most promising untested direction. LightGBM's `lambdarank`
+# optimises nDCG directly, over per-user groups, which is exactly this task's
+# shape (within-user ranking over logged impressions).
+#
+# The FM path above is untouched and `--model fm` still reproduces the published
+# ladder, so the baseline comparison stays honest.
+LGB_PARAMS = {
+    'objective': 'lambdarank',
+    # 'None', not 'ndcg'. LightGBM's built-in ndcg@5 is NOT this competition's
+    # nDCG@5: it skips groups with no positive, while evaluate() scores a
+    # zero-positive user as 0.0 and counts it in the average. Measured on the
+    # same predictions, builtin ndcg@5 = 0.8287 against the official 0.5255 —
+    # so early-stopping on the builtin optimises a different quantity and
+    # stopped this model at 18 rounds. _primary_feval below is the real metric.
+    'metric': 'None',
+    # nDCG@5 is scored on the top 5, but GAUC is half the primary and depends on
+    # the WHOLE within-user ordering. Truncating lambda pairs at 5 would optimise
+    # only the head; 30 covers the bulk of per-user impression counts.
+    'lambdarank_truncation_level': 30,
+    'learning_rate': 0.05,
+    'num_leaves': 63,
+    'min_data_in_leaf': 100,
+    'feature_fraction': 0.9,
+    'bagging_fraction': 0.9,
+    'bagging_freq': 1,
+    'lambda_l2': 1.0,
+    'verbosity': -1,
+    # Reproducibility: the orchestrator compares candidates at ~0.001 and pairs
+    # per-user scores against a parent, so a run that is not bit-reproducible at
+    # a fixed seed manufactures deltas out of thread scheduling.
+    'num_threads': 1,
+    'deterministic': True,
+    'force_row_wise': True,
+}
+
+
+def _primary_feval(users, labels):
+    """A LightGBM feval that reports the OFFICIAL primary, so early stopping
+    selects on the same number the competition scores.
+
+    run_fm already early-stops on evaluate()['primary']; this makes the GBDT
+    path do the same thing, rather than on LightGBM's own ndcg convention.
+    """
+    def feval(preds, _eval_data):
+        r = evaluate(users, labels, preds)
+        return 'primary', r['primary'], True     # higher is better
+    return feval
+
+
+def run_lgb(splits, seed=0, num_boost_round=600, patience=50, verbose=True,
+            select_on='valid', report_on=('valid', 'test'), return_preds=False,
+            params=None):
+    """Train a LambdaRank GBDT on train-only dense features, early-stopping on
+    `select_on`, and score every `report_on` split.
+
+    Mirrors run_fm's signature so the orchestrator contract below is identical
+    for both models.
+    """
+    import lightgbm as lgb
+
+    enc, feat_names, cat_names = encode_lgb(splits)
+    Xtr, ytr, _utr, gtr = enc['train']
+    Xsel, ysel, usel, gsel = enc[select_on]
+
+    p = dict(LGB_PARAMS)
+    if params:
+        p.update(params)
+    p.update({'seed': seed, 'bagging_seed': seed, 'feature_fraction_seed': seed,
+              'data_random_seed': seed})
+
+    cat_idx = [feat_names.index(c) for c in cat_names]
+    dtrain = lgb.Dataset(Xtr, label=ytr, group=gtr,
+                         feature_name=feat_names, categorical_feature=cat_idx)
+    dsel = lgb.Dataset(Xsel, label=ysel, group=gsel, reference=dtrain,
+                       feature_name=feat_names, categorical_feature=cat_idx)
+
+    callbacks = [lgb.early_stopping(patience, verbose=verbose)]
+    if verbose:
+        callbacks.append(lgb.log_evaluation(period=50))
+    booster = lgb.train(p, dtrain, num_boost_round=num_boost_round,
+                        valid_sets=[dsel], valid_names=[select_on],
+                        feval=_primary_feval(usel, ysel),
+                        callbacks=callbacks)
+    if verbose:
+        sel = evaluate(usel, ysel, booster.predict(Xsel))
+        print(f"  best_iter {booster.best_iteration} | {select_on} "
+              f"GAUC {sel['GAUC']:.4f} nDCG@5 {sel['nDCG@5']:.4f} "
+              f"primary {sel['primary']:.4f}")
+
+    out, preds = {}, {}
+    for name in report_on:
+        X, y, u, _g = enc[name]
+        s = booster.predict(X)
+        out[name] = evaluate(u, y, s)
+        preds[name] = (u, y, s)
+    return (out, preds) if return_preds else out
+
+
+#: Model used by the orchestrator when the candidate is invoked without an
+#: explicit --model. Overridable via CODEGEN_MODEL so an FM-vs-GBDT A/B is a
+#: one-env-var change rather than a code edit; codegen/sandbox.py forwards it.
+#:
+#: 'fm', NOT 'lgb', on measurement. Every GBDT-over-train-aggregates variant
+#: tried lands well below the FM on test primary:
+#:
+#:     FM (reference)                  0.5953
+#:     lgb lambdarank                  0.5755
+#:     lgb lambdarank, small capacity  0.5795
+#:     lgb binary objective            0.5800
+#:     lgb binary + OOF FM score       0.5797
+#:
+#: Two measured reasons, both structural rather than tuning:
+#:   1. The collaborative signal is not available to count features. A
+#:      user x author pair occurs 1.07 times in train on average, user x video
+#:      less, so a per-pair rate is one observation of noise. The FM's
+#:      embeddings share strength across users; smoothed counts cannot.
+#:   2. A pointwise GBDT spends its capacity on the wrong variance. In the
+#:      stacked model `user_rate` had the single largest gain (944k, twice
+#:      fm_score's) — and user_rate is CONSTANT WITHIN A USER, so it cannot
+#:      change a within-user ranking at all. The objective rewards predicting
+#:      the user's base rate; the metric ignores it entirely.
+#:
+#: `--model lgb` stays available and supported: it is a real second model the
+#: search may branch to, and the numbers above are evidence for the agent
+#: rather than a reason to delete the path.
+ORCHESTRATOR_DEFAULT_MODEL = os.environ.get('CODEGEN_MODEL', 'fm')
+
+#: The two models the orchestrator can score. `pop` and `random` are diagnostic
+#: baselines with no training loop, so they have no select_on/report_on contract.
+_ORCHESTRATOR_RUNNERS = {'fm': run_fm, 'lgb': run_lgb}
+
+
 def run_for_orchestrator(a, split):
     """Score exactly one split and emit the machine-readable metrics marker."""
     if split == 'test':
         raise SystemExit("CODEGEN_SPLIT=test refused: candidates never score the "
                          "sealed test split.")
-    if a.model != 'fm':
-        raise SystemExit(f"CODEGEN_SPLIT set but --model={a.model}; orchestrator "
-                         "mode supports fm only.")
+    # The orchestrator invokes candidates as `python <candidate> --data_dir D
+    # --seed S` with no --model, so the model comes from
+    # ORCHESTRATOR_DEFAULT_MODEL unless a caller asked for one explicitly.
+    model = a.model or ORCHESTRATOR_DEFAULT_MODEL
+    if model not in _ORCHESTRATOR_RUNNERS:
+        raise SystemExit(f"CODEGEN_SPLIT set but model={model!r}; orchestrator "
+                         f"mode supports {sorted(_ORCHESTRATOR_RUNNERS)} only.")
     splits = cut_valid_subsplits(load(a.data_dir))
     if split not in splits:
         raise SystemExit(f"unknown CODEGEN_SPLIT {split!r}; expected one of "
                          f"{sorted(VALID_SUBSPLITS)}")
     # Always select on valid_search, so scoring valid_confirm stays uncontaminated.
-    res, preds = run_fm(splits, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed,
-                        select_on='valid_search', report_on=(split,),
-                        return_preds=True)
+    kw = ({'k': a.k, 'lr': a.lr, 'epochs': a.epochs} if model == 'fm' else {})
+    res, preds = _ORCHESTRATOR_RUNNERS[model](
+        splits, seed=a.seed, select_on='valid_search', report_on=(split,),
+        return_preds=True, **kw)
     users, labels, scores = preds[split]
     # evaluate() is fed numpy predictions here, so its aggregates come back as
     # np.float32 — not JSON-serializable. Coerce to plain Python numbers.
@@ -181,6 +321,7 @@ def run_for_orchestrator(a, split):
                for k, v in res[split].items()}
     payload['split'] = split
     payload['seed'] = a.seed
+    payload['model'] = model
     payload['per_user'] = per_user_primary(users, labels, scores)
     print(f"{METRICS_MARK} {json.dumps(payload)}")
 
@@ -189,7 +330,12 @@ if __name__ == '__main__':
     ap = argparse.ArgumentParser()
     ap.add_argument('--data_dir', default='./KuaiRand-Pure/data',
                     help='KuaiRand-Pure 解压后的 data 目录')
-    ap.add_argument('--model', default='fm', choices=['pop', 'fm', 'random'])
+    # default=None, not 'fm': run_for_orchestrator has to be able to tell
+    # "nobody asked" (use ORCHESTRATOR_DEFAULT_MODEL) from "the caller asked for
+    # fm". The interactive path below still falls back to fm, so every command
+    # documented in README.md behaves exactly as before.
+    ap.add_argument('--model', default=None,
+                    choices=['pop', 'fm', 'random', 'lgb'])
     ap.add_argument('--k', type=int, default=16)
     ap.add_argument('--lr', type=float, default=0.001)
     ap.add_argument('--epochs', type=int, default=40)
@@ -199,12 +345,14 @@ if __name__ == '__main__':
     if _split:
         run_for_orchestrator(a, _split)
         raise SystemExit(0)
+    model = a.model or 'fm'          # interactive default unchanged
     print(f"loading {a.data_dir} ...")
     splits = load(a.data_dir)
     print({k_: len(v) for k_, v in splits.items()}, f"fields={FIELDS}")
     res = {'pop': run_pop, 'random': lambda s: run_random(s, a.seed),
-           'fm': lambda s: run_fm(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed)}[a.model](splits)
-    print(f"\n=== {a.model} (seed={a.seed}) ===")
+           'fm': lambda s: run_fm(s, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed),
+           'lgb': lambda s: run_lgb(s, seed=a.seed)}[model](splits)
+    print(f"\n=== {model} (seed={a.seed}) ===")
     for sp in ('valid', 'test'):
         r = res[sp]
         print(f"  {sp:5s}  GAUC {r['GAUC']:.4f} | nDCG@5 {r['nDCG@5']:.4f} | primary {r['primary']:.4f}")

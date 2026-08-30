@@ -46,7 +46,41 @@ test 集上的分数。**要打败的是 FM 这一行。**
 |---|---|---|---|
 | random（下界，自检用） | 0.4996 | 0.4511 | 0.4753 |
 | item popularity（trivial） | 0.6308 | 0.5121 | 0.5715 |
+| LightGBM lambdarank（本仓库加的，见下） | 0.6356 | 0.5154 | 0.5755 |
 | **FM（官方 baseline）** | **0.6610** | **0.5282** | **0.5946** |
+
+### 本仓库追加：`--model lgb`（LightGBM，实测**打不过** FM）
+
+`python3 baseline.py --model lgb`。特征全部是 **train-only** 的聚合量
+（video / author / user 的平滑 long_view 率、曝光计数、duration、tab，
+以及一个 video × 用户活跃度十分位 的粗粒度交叉），实现见 `data.py:encode_lgb`。
+早停用的是**官方 primary**（`_primary_feval`），不是 LightGBM 自带的 ndcg
+—— 后者跳过全负用户，同一份预测下自带 ndcg@5 报 0.8287 而官方口径是 0.5255。
+
+实测（test primary）：
+
+| 配置 | primary |
+|---|---|
+| lambdarank | 0.5755 |
+| lambdarank，降容量 | 0.5795 |
+| binary objective | 0.5800 |
+| binary + 3-fold OOF FM 分数做特征 | 0.5797 |
+| **FM（参照）** | **0.5953** |
+
+**为什么打不过，两条都是结构性的、不是调参问题：**
+
+1. **协同信号拿不到。** train 里 `user × author` 平均只出现 **1.07** 次
+   （1,070,326 对 / 1,141,112 行），`user × video` 更稀疏。所以任何 per-pair
+   target encoding 都只是一次观测的噪声，平滑之后退回 author 率。FM 的
+   embedding 靠 SGD 在用户之间共享统计强度，计数特征做不到 —— 这正是 FM
+   的 0.5946 高于纯 item popularity 的 0.5715 的原因。
+2. **pointwise GBDT 把容量花在了指标忽略的方差上。** 在 stack 模型里增益最大
+   的特征是 `user_rate`（944k，是 fm_score 的两倍），而它**在用户内是常数**，
+   按定义不可能改变用户内排序。目标函数奖励"预测该用户的基础率"，而指标只看
+   用户内顺序。
+
+这条路留在仓库里作为**已测负结果**（也写进了 `orchestrator/_state` 的 memory
+preseed 和 `llm_calls/personas.py` 的上下文），agent 不必再花迭代重新发现。
 
 ### ⚠️ 指标的真实区间：nDCG@5 的天花板是 0.729，不是 1.0
 
