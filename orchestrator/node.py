@@ -17,7 +17,13 @@ class Node:
     seeds_run: List[int] = field(default_factory=list)
     evidence_type: Optional[str] = None  # "invariant" | "refuted_under_context"
                                           # | "failed_implementation" | "no_op"
-                                          # | "inconclusive"
+                                          # | "timeout" | "inconclusive"
+                                          # "timeout" is deliberately NOT
+                                          # "failed_implementation": the code ran,
+                                          # it just exceeded
+                                          # driver.TRIAGE_WALLCLOCK_CAP_S, so the
+                                          # mechanism is unmeasured rather than
+                                          # unimplementable.
 
     # One of: "draft" (a root seed), "improve" (a modification of an ok parent),
     # "fix" (a repair applied to a failed parent), "refine" (Phase 2: a component-

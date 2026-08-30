@@ -142,6 +142,11 @@ def execute(code_path: str, seed: int, split: str, wallclock_cap_seconds: int,
     }
     if "SYSTEMROOT" in os.environ:            # windows needs it
         env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
+    # Forwarded, not defaulted: baseline.py owns the default
+    # (ORCHESTRATOR_DEFAULT_MODEL). env is built from scratch above, so without
+    # this an FM-vs-GBDT A/B set in the parent shell would be silently dropped.
+    if "CODEGEN_MODEL" in os.environ:
+        env["CODEGEN_MODEL"] = os.environ["CODEGEN_MODEL"]
 
     cmd = [sys.executable, base, "--data_dir", os.path.abspath(data_dir), "--seed", str(seed)]
     try:

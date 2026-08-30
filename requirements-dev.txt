@@ -1,1 +1,6 @@
 python-dotenv>=1.0
+# baseline.py --model lgb. Candidates the agent generates may import it too, so
+# it has to be present in the interpreter the orchestrator runs under —
+# codegen/sandbox.py spawns sys.executable, so a venv install is inherited.
+# Imported lazily inside run_lgb, so the FM path still runs without it.
+lightgbm>=4.0

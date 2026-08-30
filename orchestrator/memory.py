@@ -39,7 +39,8 @@ class Memory:
             json.dump([asdict(e) for e in self.entries], fh, indent=2)
 
     def _preseed(self):
-        """Two dead ends the starter-kit README already measured."""
+        """Dead ends already measured — two from the starter-kit README, two
+        from this repo's own LightGBM evaluation."""
         self.entries.append(EvidenceEntry(
             fingerprint=("pointwise_logloss", "uniform", "cwm_13field", "pure"),
             architecture="FM", loss="pointwise_logloss", sampler="uniform",
@@ -55,6 +56,34 @@ class Memory:
             confidence_interval=None, code_hash="preseed_capacity",
             evidence_type="refuted_under_context",
             note="k=8/16/32 gave 0.5895/0.5902/0.5887; capacity is not the bottleneck"))
+        self.entries.append(EvidenceEntry(
+            fingerprint=("lambdarank", "uniform", "lgb_train_aggregates", "pure"),
+            architecture="LightGBM", loss="lambdarank", sampler="uniform",
+            split="valid+test", seed_count=1,
+            confidence_interval=(0.5755, 0.5800),
+            code_hash="preseed_lgb_aggregates",
+            evidence_type="refuted_under_context",
+            note=("GBDT over train-only count aggregates (smoothed video/author/"
+                  "user long_view rates, exposure counts, duration, tab, and a "
+                  "video x user-activity-decile cross): test primary 0.5755 "
+                  "lambdarank / 0.5795 small-capacity / 0.5800 binary, all below "
+                  "the FM's 0.5953. Cause: a user x author pair occurs 1.07 times "
+                  "in train on average, so per-pair target encoding is one "
+                  "observation of noise — FM embeddings share strength across "
+                  "users, count features cannot.")))
+        self.entries.append(EvidenceEntry(
+            fingerprint=("binary_logloss", "uniform", "lgb_plus_oof_fm_score", "pure"),
+            architecture="LightGBM+FM", loss="binary_logloss", sampler="uniform",
+            split="valid+test", seed_count=1,
+            confidence_interval=(0.5797, 0.5797),
+            code_hash="preseed_lgb_fm_stack",
+            evidence_type="refuted_under_context",
+            note=("Stacking a 3-fold out-of-fold FM score into the GBDT's "
+                  "features: test primary 0.5797, still below the FM's 0.5953. "
+                  "The largest feature gain by 2x was `user_rate`, which is "
+                  "CONSTANT WITHIN A USER and so cannot change a within-user "
+                  "ranking — a pointwise GBDT spends its capacity on between-user "
+                  "variance the metric ignores.")))
 
     def is_duplicate(self, fingerprint: Fingerprint) -> Optional[EvidenceEntry]:
         for e in self.entries:
