@@ -18,14 +18,17 @@ from typing import List
 # from .mocks import harness, llm, codegen
 
 import harness
-from llm_calls import diagnose, ground_in_literature, generate_hypothesis, audit
+from llm_calls import (diagnose, ground_in_literature, generate_hypothesis,
+                       refine, audit)
 import codegen
+from codegen.ablations import ABLATIONS
 
 
 class _LLM:
     diagnose = staticmethod(diagnose)
     ground_in_literature = staticmethod(ground_in_literature)
     generate_hypothesis = staticmethod(generate_hypothesis)
+    refine = staticmethod(refine)
     audit = staticmethod(audit)
 llm = _LLM()
 
@@ -36,6 +39,10 @@ from .triage import rank
 from .promotion import bootstrap_delta, should_continue_locally, should_promote_globally
 from .convergence import local_plateau, global_should_stop
 from .counters import Counters
+from . import ablation_harness
+from .ablation_harness import (run_ablations, pick_weakest_component,
+                               load_cache as _load_ablation_cache,
+                               _cache_key as _ablation_cache_key)
 
 # Toggle from CLI. When False, diff bodies aren't printed each iteration —
 # keeps run.log readable across a 50-iter run.
@@ -45,10 +52,78 @@ SHOW_DIFFS = False
 # run can be inspected mid-flight instead of waiting for run() to return.
 PROGRESS_PATH = "orchestrator/_state/progress.json"
 
+# Append-only per-node record: hypothesis, diagnosis, resulting metrics and
+# error/recovery events, one JSON object per line. Kept separate from
+# progress.json (which is rewritten whole each iteration and holds aggregates).
+NODES_LOG_PATH = "orchestrator/_state/nodes.jsonl"
+
 # Measured once per machine and reused: the unmodified baseline's per-user scores,
 # which every candidate is paired against. ~20s per seed, so this is cheap.
 ROOT_BASELINE_PATH = "orchestrator/_state/root_baseline.json"
 ROOT_SEEDS = (0, 1, 2)
+
+# The baseline scored on the SEALED valid_confirm split, measured lazily on the
+# first promotion attempt and cached. Promotion used to compare a candidate's
+# valid_confirm primary against a global_best carried on valid_search — two
+# different splits, so the "delta" mixed a real effect with the level difference
+# between splits and meant nothing. A promotion test needs same-split baseline
+# per-user scores to pair against.
+CONFIRM_BASELINE_PATH = "orchestrator/_state/root_confirm_baseline.json"
+CONFIRM_SEEDS = (0,)
+
+# Promotion trigger: spend a sealed valid_confirm query only when the candidate
+# is significantly better than its parent on the paired per-user bootstrap AND
+# its scalar clears the current champion. The old trigger was
+# `local_best_score > global_best + 0.003` — four times larger than the best
+# delta this search has ever produced (+0.0011), so no candidate was ever
+# eligible for a confirm run at all.
+PROMOTE_TRIGGER_P_POS = 0.9
+
+# Two candidate per-user vectors closer than this are the same computation.
+# A rewrite that applies cleanly but leaves the executed code path untouched
+# reproduces its parent's score exactly, to the last bit of the float.
+NOOP_EPSILON = 1e-9
+
+# Repair attempts per candidate. A candidate that fails, gets repaired to a
+# still-broken state and fails again would otherwise loop forever; two attempts
+# is enough at hackathon scale, since the second retry rarely helps if the
+# first didn't.
+MAX_FIX_ATTEMPTS = 2
+
+# Phase 2 (MLE-STAR ablation-guided refinement) kill switch.
+#
+# OFF: the search measurably regressed once refine was in the loop, so the
+# driver is back to the Phase 1 behaviour — improve every iteration, no
+# ablation passes, no refine nodes, and no ablation evidence in the
+# diagnostician's context. Nothing is deleted: the registry, the harness, the
+# refiner prompt and their tests are all still here, and flipping this to True
+# restores Phase 2 exactly as it was. The Phase 2 test modules skip themselves
+# while this is False.
+#
+# Everything below this line under "Refine ..." is inert until it flips.
+REFINE_ENABLED = False
+
+# Refine cadence. Fixed floor: every K improve iterations, the next
+# iteration turns into an ablation pass + one component-scoped refine.
+REFINE_EVERY_K_IMPROVES = 3
+
+# Refine ceiling: if improvement_score (iter_history[-1] - iter_history[-4])
+# drops at or below this threshold, refine fires on the NEXT iteration
+# regardless of how many improves have accumulated. The threshold is well
+# below ε=0.002 (the local_plateau bar) so refine reacts before the run
+# actually converges and stops.
+PLATEAU_REFINE_THRESHOLD = 0.001
+
+# Refine gate: a node only earns an ablation pass once its own evolution has
+# produced measurable headroom over the baseline. Matched to
+# PLATEAU_REFINE_THRESHOLD's scale — comfortably above the baseline's ~0.0008
+# 5-seed std, low enough that a marginal-but-real improvement unlocks refine.
+REFINE_TARGET_MIN_IMPROVEMENT = 0.0005
+
+# The registry's component names. Imported from codegen.ablations rather than
+# read off the `codegen` binding above, which --mock swaps for a stub that has
+# no registry.
+_ABLATION_COMPONENTS = tuple(ABLATIONS)
 
 # codegen.execute defaults data_dir to <root>/KuaiRand-Pure/data, and we pass the
 # per-candidate STAGED dir as root — which holds only the patched .py files, no
@@ -75,6 +150,7 @@ def _new_root() -> Node:
     paired delta list came back empty (see _measure_root).
     """
     return Node(id=_new_id(), parent_id=None, code_path="baseline.py",
+                operation="draft",
                 local_best_score=FALLBACK_ROOT_PRIMARY)
 
 
@@ -139,8 +215,57 @@ def _measure_root(root: Node, counters: Counters, *, seeds=ROOT_SEEDS,
 
     root.per_user_by_seed = per_user
     root.seeds_run = sorted(per_user)
-    root.local_best_score = max(v["primary"] for v in blob["seeds"].values())
+    root.per_seed_primary = {int(s): v["primary"] for s, v in blob["seeds"].items()}
+    # MEAN, not max. See _scalar_primary: the root runs 3 seeds and most
+    # candidates finish only a 1-seed triage run, so a max-vs-max comparison
+    # gave the root a free E[max of 3] - E[max of 1] ~= 0.85*sigma head start.
+    root.local_best_score = _scalar_primary(root)
     return True
+
+
+def _measure_confirm_baseline(counters: Counters, *, seeds=CONFIRM_SEEDS,
+                              cache_path: str | None,
+                              wallclock_cap_s: int = 1800,
+                              verbose: bool = True) -> dict[int, dict[str, float]]:
+    """Per-user baseline scores on valid_confirm, measured once and cached.
+
+    Promotion pairs a candidate against this, on the same split. One seed is
+    enough: the paired bootstrap runs over thousands of users, and every query
+    here spends the sealed split's budget.
+
+    Returns {seed: {user: primary}}, empty if the baseline could not be scored.
+    """
+    if cache_path and os.path.exists(cache_path):
+        try:
+            with open(cache_path) as fh:
+                cached = json.load(fh)
+            if cached.get("split") == "valid_confirm" and cached.get("seeds"):
+                return {int(s): v.get("per_user", {})
+                        for s, v in cached["seeds"].items()}
+        except (OSError, ValueError):
+            pass
+
+    measured = {}
+    for s in seeds:
+        r = codegen.execute("baseline.py", seed=s, split="valid_confirm",
+                            wallclock_cap_seconds=wallclock_cap_s, root=".",
+                            data_dir=DATA_DIR)
+        counters.bump("full_runs")
+        counters.bump_scorer("valid_confirm")
+        if r["status"] != "ok":
+            if verbose:
+                print(f"[confirm] baseline seed={s} {r['status']}; skipping seed")
+            continue
+        measured[str(s)] = {"primary": r["metrics"]["primary"],
+                            "per_user": r["metrics"].get("per_user", {})}
+    if not measured:
+        if verbose:
+            print("[confirm] WARNING: baseline never scored on valid_confirm; "
+                  "no candidate can be promoted.")
+        return {}
+    if cache_path:
+        _write_json_atomic(cache_path, {"split": "valid_confirm", "seeds": measured})
+    return {int(s): v.get("per_user", {}) for s, v in measured.items()}
 
 
 def _fingerprint(h: dict):
@@ -172,11 +297,52 @@ def _best_primary(c: Node) -> float:
     Survivors get local_best_score from the full-seed runs; candidates that
     only completed a triage run keep local_best_score == -inf and carry their
     score in partial_scores. Take the max of whatever exists.
+
+    Retained for nodes that carry no per-seed breakdown; _scalar_primary is the
+    score the search actually compares on.
     """
     scores = list(c.partial_scores)
     if c.local_best_score > float("-inf"):
         scores.append(c.local_best_score)
     return max(scores) if scores else float("-inf")
+
+
+def _scalar_primary(c: Node) -> float:
+    """The one number the search ranks a node by: MEAN primary over its seeds.
+
+    Deliberately the mean. The root is measured on 3 seeds while most candidates
+    finish only the 1-seed triage run, so a max-vs-max comparison hands whichever
+    side ran more seeds a free E[max of n] head start. Measured on this repo's
+    own cached root baseline (per-seed 0.594505 / 0.594966 / 0.594448): max
+    0.594966 against mean 0.594640, a bias of +0.00033 — a third of the largest
+    delta the search has ever produced (+0.0011), paid by the candidate every
+    time. A mean is unbiased in the number of seeds, so a 1-seed candidate and a
+    3-seed root are compared on equal terms: noisier, but not tilted.
+    """
+    if c.per_seed_primary:
+        return sum(c.per_seed_primary.values()) / len(c.per_seed_primary)
+    return _best_primary(c)
+
+
+def _is_no_op(cand: Node, parent: Node, seed: int) -> bool:
+    """True if the candidate reproduced its parent's per-user scores exactly.
+
+    A rewrite can apply cleanly, pass the gate, run to completion and still not
+    touch the code that executes — the classic shape is a new helper function
+    that nothing calls. Then every per-user score matches the parent bit for bit.
+    Detecting that here turns a silent "no improvement" into a named, actionable
+    outcome, and stops the memory store from recording the mechanism as
+    genuinely refuted when it was never actually tried.
+
+    Returns False when there is nothing to compare against, so a missing parent
+    measurement is never reported as a no-op.
+    """
+    cu = cand.per_user_by_seed.get(seed) or {}
+    pu = parent.per_user_by_seed.get(seed) or {}
+    shared = set(cu) & set(pu)
+    if not shared:
+        return False
+    return all(abs(cu[u] - pu[u]) < NOOP_EPSILON for u in shared)
 
 
 def _write_json_atomic(path: str, payload: dict) -> None:
@@ -185,6 +351,200 @@ def _write_json_atomic(path: str, payload: dict) -> None:
     with open(tmp, "w") as fh:
         json.dump(payload, fh, indent=2)
     os.replace(tmp, path)   # atomic: tailing mid-run never sees a partial write
+
+
+def _append_nodes_log(candidates: List[Node], iter_no: int,
+                      path: str | None = None) -> None:
+    """Append one JSON object per candidate to nodes.jsonl.
+
+    Each line stands alone: a later iteration's failure never corrupts prior
+    records, and `tail -f nodes.jsonl | jq .` streams live. Diagnosis and
+    hypothesis go in verbatim because they are the record judges read to
+    assess Autonomy.
+
+    `path` resolves against the module global at CALL time rather than defaulting
+    to it in the signature: a default would freeze the repo path at import, so a
+    test redirecting NODES_LOG_PATH would clear its tmp file and then write into
+    the live orchestrator/_state/ anyway.
+    """
+    path = path or NODES_LOG_PATH
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, "a", encoding="utf-8") as fh:
+        for c in candidates:
+            fh.write(json.dumps({
+                "iter": iter_no,
+                "id": c.id,
+                "parent_id": c.parent_id,
+                "operation": c.operation,
+                "status": c.status,
+                "evidence_type": c.evidence_type,
+                "code_dir": c.code_dir,
+                "hypothesis": c.hypothesis,
+                "diagnosis": c.diagnosis,
+                "per_seed_primary": c.per_seed_primary,
+                "mean_delta": c.mean_delta,
+                "p_positive": c.p_positive,
+                "lower_95": c.lower_95,
+                "fix_attempts": c.fix_attempts,
+                "wallclock_used_s": round(c.wallclock_used_s, 2),
+            }, default=str) + "\n")
+
+
+def _prior_refines_for_component(component: str,
+                                 path: str | None = None) -> List[dict]:
+    """Scan nodes.jsonl for prior refine attempts on this component.
+
+    Returns a list of {mechanism, mean_delta} dicts, oldest first. Empty
+    if nodes.jsonl doesn't exist or has no matching entries.
+
+    `path` resolves at CALL time for the same reason _append_nodes_log's does.
+    """
+    path = path or NODES_LOG_PATH
+    if not os.path.exists(path):
+        return []
+    out = []
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+                if (r.get("operation") == "refine"
+                        and (r.get("diagnosis") or {}).get("component") == component):
+                    out.append({
+                        "mechanism": (r.get("hypothesis") or {}).get("mechanism"),
+                        "mean_delta": r.get("mean_delta"),
+                    })
+            except ValueError:
+                continue
+    return out
+
+
+def _refine_triggers(iter_history: List[float], improves_since_refine: int
+                     ) -> tuple[bool, bool, float | None]:
+    """Should this iteration refine instead of improve?
+
+    Returns (cadence_trigger, plateau_trigger, recent_improvement). Pulled out
+    of run()'s loop as a pure function so both triggers can be tested without
+    a test-only hook for seeding the closure's iter_history.
+
+    recent_improvement is iter_history[-1] - iter_history[-4] evaluated at the
+    START of an iteration, so it equals the improvement_score that
+    _record_iteration wrote for the PREVIOUS iteration. None until four
+    entries exist (baseline + three completed iterations).
+    """
+    recent_improvement = (iter_history[-1] - iter_history[-4]
+                          if len(iter_history) >= 4 else None)
+    cadence_trigger = improves_since_refine >= REFINE_EVERY_K_IMPROVES
+    plateau_trigger = (recent_improvement is not None
+                       and recent_improvement <= PLATEAU_REFINE_THRESHOLD)
+    return cadence_trigger, plateau_trigger, recent_improvement
+
+
+def _build_improve_candidates(parent: Node, *,
+                              diag_llm, memory: Memory,
+                              counters: Counters,
+                              history: List[float],
+                              iter_history: List[float],
+                              improvement_score: float | None,
+                              verbose: bool = True
+                              ) -> tuple[dict, List[Node]]:
+    """The pre-Phase-2 improve path, factored out and enriched with
+    trajectory signals. Returns (diagnosis, the dedup'd list of new Nodes).
+
+    The diagnosis comes back alongside the candidates because the caller's
+    _attempt() closure needs it to route the writer at target_component. It
+    cannot be recovered from an empty candidate list.
+    """
+    # With Phase 2 off, no ablation evidence reaches the diagnostician — a
+    # stale ablations.jsonl from an earlier run would otherwise keep feeding
+    # it, and this path is meant to be the pre-Phase-2 one exactly.
+    cached_ablations: dict = {}
+    if REFINE_ENABLED:
+        _abl_cache = _load_ablation_cache()
+        cached_ablations = {
+            name: _abl_cache.get(_ablation_cache_key(parent.id, name))
+            for name in _ABLATION_COMPONENTS
+        }
+        cached_ablations = {k: v for k, v in cached_ablations.items()
+                            if v is not None}
+
+    diag = diag_llm.diagnose({
+        "parent": parent.id,
+        "history": history,                     # promotion ladder (unchanged)
+        "iter_history": list(iter_history),     # iteration-level trajectory
+        "improvement_score": improvement_score, # current ε/N plateau signal
+        "ablations": cached_ablations or None,
+    })
+    counters.bump("tokens", 500)
+    evidence_card = diag_llm.ground_in_literature(diag["bottleneck"])
+    counters.bump("tokens", 500)
+    hypotheses = diag_llm.generate_hypothesis(diag, evidence_card)
+    counters.bump("proposals", len(hypotheses))
+    counters.bump("tokens", 300 * len(hypotheses))
+
+    candidates: List[Node] = []
+    for h in hypotheses:
+        fp = _fingerprint(h)
+        if memory.is_duplicate(fp):
+            continue
+        candidates.append(Node(
+            id=_new_id(), parent_id=parent.id, code_path=parent.code_path,
+            code_dir=parent.code_dir,
+            operation="improve",
+            diagnosis=diag, hypothesis=h,
+        ))
+    if verbose:
+        print(f"  hypotheses={len(hypotheses)} candidates={len(candidates)}")
+    return diag, candidates
+
+
+#: The four root modules a candidate stages and the sandbox runs.
+_STAGED_MODULES = ("data.py", "evaluate.py", "baseline.py", "submit.py")
+
+
+def _apply_diff_to_dir(diff: str, target_dir: str) -> bool:
+    """Apply a unified diff to files under target_dir. Returns True on success.
+
+    Try `patch` first (present on macOS), fall back to `git apply`. Both are
+    tried at -p1 and -p0: models emit headers with (`a/data.py`) and without
+    (`data.py`) the prefix, and the wrong strip level makes patch report
+    "can't find file to patch" on a diff that is otherwise fine.
+
+    stdin=DEVNULL is load-bearing: with no strip level that resolves, `patch`
+    interactively prompts "File to patch:" and would hang an unattended run.
+    """
+    diff_path = os.path.join(target_dir, "_patch.diff")
+    with open(diff_path, "w", encoding="utf-8") as fh:
+        fh.write(diff)
+    for cmd in (["patch", "-p1", "-i", "_patch.diff"],
+                ["patch", "-p0", "-i", "_patch.diff"],
+                ["git", "apply", "--unsafe-paths", "_patch.diff"],
+                ["git", "apply", "--unsafe-paths", "-p0", "_patch.diff"]):
+        try:
+            subprocess.run(cmd, cwd=target_dir, check=True,
+                           stdin=subprocess.DEVNULL,
+                           capture_output=True, text=True)
+            return True
+        except (subprocess.CalledProcessError, FileNotFoundError):
+            continue
+    return False
+
+
+def _dir_sha256(directory: str,
+                files: tuple[str, ...] = _STAGED_MODULES) -> str:
+    """Hash the contents of the named files under directory, in order.
+
+    Used to verify that applying a repair diff actually changed something —
+    a repair may edit data.py rather than baseline.py, so hashing just
+    c.code_path would miss real changes.
+    """
+    h = hashlib.sha256()
+    for name in files:
+        path = os.path.join(directory, name)
+        if os.path.exists(path):
+            h.update(name.encode())
+            with open(path, "rb") as fh:
+                h.update(fh.read())
+    return h.hexdigest()
 
 
 def _apply_diff_and_stage(diff: str, root: str, candidate_id: str) -> str | None:
@@ -201,40 +561,27 @@ def _apply_diff_and_stage(diff: str, root: str, candidate_id: str) -> str | None
     if os.path.exists(cand_dir):
         shutil.rmtree(cand_dir)
     os.makedirs(cand_dir)
-    for name in ("data.py", "evaluate.py", "baseline.py", "submit.py"):
+    for name in _STAGED_MODULES:
         src = os.path.join(root, name)
         if os.path.exists(src):
             shutil.copy2(src, os.path.join(cand_dir, name))
-    diff_path = os.path.join(cand_dir, "_patch.diff")
-    with open(diff_path, "w") as fh:
-        fh.write(diff)
-    # Try `patch` first (present on macOS), fall back to `git apply`. Both are
-    # tried at -p1 and -p0: models emit headers with (`a/data.py`) and without
-    # (`data.py`) the prefix, and the wrong strip level makes patch report
-    # "can't find file to patch" on a diff that is otherwise fine.
-    #
-    # stdin=DEVNULL is load-bearing: with no strip level that resolves, `patch`
-    # interactively prompts "File to patch:" and would hang an unattended run.
-    for cmd in (["patch", "-p1", "-i", "_patch.diff"],
-                ["patch", "-p0", "-i", "_patch.diff"],
-                ["git", "apply", "--unsafe-paths", "_patch.diff"],
-                ["git", "apply", "--unsafe-paths", "-p0", "_patch.diff"]):
-        try:
-            subprocess.run(cmd, cwd=cand_dir, check=True,
-                           stdin=subprocess.DEVNULL,
-                           capture_output=True, text=True)
-            return cand_dir
-        except (subprocess.CalledProcessError, FileNotFoundError):
-            continue
-    return None
+    return cand_dir if _apply_diff_to_dir(diff, cand_dir) else None
 
 
 def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = True,
         progress_path: str | None = PROGRESS_PATH,
-        root_baseline_path: str | None = ROOT_BASELINE_PATH):
-    memory = Memory()
+        root_baseline_path: str | None = ROOT_BASELINE_PATH,
+        confirm_baseline_path: str | None = CONFIRM_BASELINE_PATH,
+        memory_path: str | None = None):
+    memory = Memory(path=memory_path) if memory_path else Memory()
     counters = Counters()
     t_start = time.time()
+
+    # nodes.jsonl is append-only within a run, so a fresh run must start clean
+    # or its records interleave with the previous run's under the same iter
+    # numbers. progress_path=None means "write nothing", log included.
+    if progress_path and os.path.exists(NODES_LOG_PATH):
+        os.remove(NODES_LOG_PATH)
 
     root = _new_root()
     if verbose:
@@ -253,38 +600,93 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
     global_best_node = root
     history: List[float] = [root.local_best_score]
 
+    # The root is line 0 of the log: the draft seed every later node descends
+    # from, emitted before any iteration so the tree reads top-down.
+    if progress_path:
+        _append_nodes_log([root], iter_no=0)
+
+    # Baseline per-user scores on the sealed valid_confirm split. Measured lazily
+    # on the first promotion attempt so a run that never triggers one spends
+    # nothing from that split's budget.
+    confirm_baseline: dict | None = None
+
     # One entry per iteration. Kept separate from `history`, which stays a
     # promotion-only ladder because local_plateau() and llm.diagnose() both
     # read it — padding it per-iteration would trip the plateau break at ~4.
     iter_records: List[dict] = []
+    iter_history: List[float] = [root.local_best_score]   # index 0 = baseline
+
+    # Refine scheduling. Private to the run — deliberately not persisted to
+    # nodes.jsonl, which records what was tried, not how it was scheduled.
+    improves_since_refine = 0
 
     # Diff-hash dedup — spans the whole run, not just one iteration. Prevents
     # burning execute calls on codegen outputs we've already tried.
     seen_diff_hashes: set = set()
 
-    def _record_iteration(it: int, candidates: List[Node],
-                          promoted_ids: List[str]) -> None:
-        """Snapshot this iteration's scores, print them, rewrite the progress file."""
-        pairs = [(c, _best_primary(c)) for c in candidates]
+    def _record_iteration(it: int, candidates: List[Node], promoted_ids: List[str],
+                          global_best_at_start: float) -> None:
+        """Snapshot this iteration's scores, print them, rewrite the progress file.
+
+        curr_vs_baseline is measured against the champion as it stood when the
+        iteration BEGAN. Using the live value made the one iteration that
+        actually promoted report a delta of +0.000000, since the candidate had
+        just become the thing it was being compared to.
+        """
+        nonlocal iter_history
+        pairs = [(c, _scalar_primary(c)) for c in candidates]
         scored = [(c, s) for c, s in pairs if s > float("-inf")]
         best_node, iter_primary = max(scored, key=lambda cs: cs[1],
                                       default=(None, None))
+        # The paired delta is the honest read on whether this iteration found
+        # anything. iter_primary compares two noisy absolute numbers; mean_delta
+        # is per-user paired against the parent, so a real +0.0007 shows up here
+        # as significant instead of being lost in the seed spread.
+        delta_pairs = [(c, c.mean_delta) for c, _ in pairs
+                       if c.mean_delta is not None]
+        best_delta_node, best_mean_delta = max(
+            delta_pairs, key=lambda cd: cd[1], default=(None, None))
+
+        prev = iter_history[-1]
+        # Carry-forward on None: iterations where nothing scored count as
+        # "no improvement," not "no data." Otherwise 3 all-failed iterations
+        # would never accumulate toward the ε/N plateau signal.
+        running_best = max(prev, iter_primary) if iter_primary is not None else prev
+        iter_history.append(running_best)
+        # Exactly the quantity local_plateau() compares against ε: the running
+        # best now minus the running best three iterations ago.
+        improvement_score = (iter_history[-1] - iter_history[-4]
+                             if len(iter_history) >= 4 else None)
+
         iter_records.append({
             "iter": it,
             "elapsed_s": round(time.time() - t_start, 1),
-            "global_best": global_best,       # confirmed champion (valid_confirm-gated)
+            "baseline": global_best,          # renamed from global_best; still updates on
+                                              # a confirmed promotion, but on runs without
+                                              # one it equals baseline_primary
             "iter_primary": iter_primary,     # score after THIS iteration's amendment
+            "running_best": iter_history[-1],
+            "improvement_score": improvement_score,
             "iter_primary_node": best_node.id if best_node else None,
-            "delta_vs_global": (iter_primary - global_best)
-                               if iter_primary is not None else None,
+            "curr_vs_baseline": (iter_primary - global_best_at_start)
+                                if iter_primary is not None else None,
+            "best_mean_delta": best_mean_delta,
+            "best_mean_delta_node": best_delta_node.id if best_delta_node else None,
             "n_candidates": len(candidates),
             "n_scored": len(scored),
             "n_open_nodes": len(open_nodes),
             "promoted": promoted_ids,
             # Every candidate, not just the scored ones: when iter_primary is
             # null it's the unscored candidates' evidence_type that says why.
+            # n_seeds is here because a 1-seed and a 3-seed primary are not the
+            # same measurement, and reading the file without it hides that.
             "candidates": [{"id": c.id,
                             "primary": s if s > float("-inf") else None,
+                            "n_seeds": len(c.per_seed_primary),
+                            "mean_delta": c.mean_delta,
+                            "p_positive": c.p_positive,
+                            "lower_95": c.lower_95,
+                            "confirm_primary": c.confirm_primary,
                             "status": c.status,
                             "evidence_type": c.evidence_type} for c, s in pairs],
         })
@@ -293,13 +695,17 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             rec = iter_records[-1]
             if rec["n_scored"]:
                 scores_str = ", ".join(
-                    f"{c['id']}={c['primary']:.4f}"
+                    f"{c['id']}={c['primary']:.4f}/{c['n_seeds']}s"
                     for c in sorted((c for c in rec["candidates"]
                                      if c["primary"] is not None),
                                     key=lambda c: -c["primary"]))
+                # The paired delta, when there is one, is the line to read: it
+                # resolves gains an absolute-score comparison buries in noise.
+                delta_str = ("" if rec["best_mean_delta"] is None else
+                             f" | best paired delta {rec['best_mean_delta']:+.4f}")
                 print(f"[iter {it}] iter_primary={rec['iter_primary']:.4f} "
-                      f"({rec['delta_vs_global']:+.4f} vs global_best) "
-                      f"| candidates: {scores_str}")
+                      f"({rec['curr_vs_baseline']:+.4f} vs baseline)"
+                      f"{delta_str} | candidates: {scores_str}")
             else:
                 # Say why there's no score, else "n/a" is unreadable in run.log.
                 tally = Counter(c["evidence_type"] or "unresolved"
@@ -308,6 +714,9 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 print(f"[iter {it}] iter_primary=n/a "
                       f"(0/{rec['n_candidates']} scored"
                       f"{': ' + why if why else ''})")
+
+        if progress_path:
+            _append_nodes_log(candidates, iter_no=it)
 
         if progress_path:
             _write_json_atomic(progress_path, {
@@ -320,6 +729,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 "iters_completed": it,
                 "global_best": global_best,
                 "history": list(history),
+                "iter_history": list(iter_history),
                 "counters": asdict(counters),
                 "iterations": iter_records,
             })
@@ -339,32 +749,121 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 print(f"[stop] global convergence at iter {it}")
             break
 
-        parent = select(open_nodes)
-        parent.n_visits += 1
         promoted_ids: List[str] = []
+        # Frozen here so curr_vs_baseline reports against the champion this
+        # iteration had to beat, not the one it may itself have just become.
+        global_best_at_start = global_best
 
-        # 1. diagnose + hypothesize
-        diag = llm.diagnose({"parent": parent.id, "history": history})
-        counters.bump("tokens", 500)
-        evidence_card = llm.ground_in_literature(diag["bottleneck"])
-        counters.bump("tokens", 500)
-        hypotheses = llm.generate_hypothesis(diag, evidence_card)
-        counters.bump("proposals", len(hypotheses))
-        counters.bump("tokens", 300 * len(hypotheses))
+        # 1. Route the iteration: refine (MLE-STAR, ablation-guided) or improve.
+        #
+        # Two triggers, either sufficient. Cadence is the floor — every K
+        # improves, look at what the pipeline is actually leaning on. The
+        # plateau signal is the ceiling: it fires whenever the run needs it
+        # most, which may be well before K accumulates.
+        #
+        # REFINE_ENABLED is off, so this whole block short-circuits and every
+        # iteration takes the improve path. recent_improvement is still needed
+        # downstream — it is the ε/N plateau signal the Phase 1 progress
+        # schema and the diagnostician's context both report.
+        if REFINE_ENABLED:
+            cadence_trigger, plateau_trigger, recent_improvement = _refine_triggers(
+                iter_history, improves_since_refine)
+        else:
+            cadence_trigger = plateau_trigger = False
+            _, _, recent_improvement = _refine_triggers(iter_history, 0)
 
-        # 2. fingerprint dedup against memory
+        # Ablation deltas are only meaningful against a node with measured
+        # per-user data — an unmeasured node has no primary to subtract from.
+        # Additionally, refine only earns its cost against a node whose
+        # evolution has produced measurable headroom over baseline. On the
+        # pristine root every ablation just reports the baseline's own
+        # component-utility profile and picking a weakest is essentially random.
+        refine_target = max(
+            (n for n in open_nodes
+             if n.per_user_by_seed
+             and n.local_best_score > root.local_best_score
+                                      + REFINE_TARGET_MIN_IMPROVEMENT),
+            key=lambda n: n.local_best_score, default=None,
+        ) if REFINE_ENABLED else None
+        if (cadence_trigger or plateau_trigger) and refine_target is None:
+            if verbose:
+                print(f"[iter {it}] refine trigger fired but no target above "
+                      f"baseline+{REFINE_TARGET_MIN_IMPROVEMENT} — "
+                      f"improving instead")
+
+        diag = None
         candidates: List[Node] = []
-        for h in hypotheses:
-            fp = _fingerprint(h)
-            if memory.is_duplicate(fp):
-                continue
-            candidates.append(Node(
-                id=_new_id(), parent_id=parent.id, code_path=parent.code_path,
-                diagnosis=diag, hypothesis=h,
-            ))
+        if (cadence_trigger or plateau_trigger) and refine_target is not None:
+            if verbose:
+                # Name every trigger that fired, not just the first one that
+                # matched: "plateau" alone would hide that the cadence floor
+                # had also come due, which is the thing you want to know when
+                # tuning K against the threshold.
+                why = "+".join(w for w, on in (("cadence", cadence_trigger),
+                                               ("plateau", plateau_trigger))
+                               if on)
+                print(f"[iter {it}] refine triggered by {why} "
+                      f"(improvement_score={recent_improvement}, "
+                      f"improves_since_refine={improves_since_refine})")
 
-        if verbose:
-            print(f"[iter {it}] hypotheses={len(hypotheses)} candidates={len(candidates)}")
+            # The refine node descends from the ablated node, not from
+            # select()'s pick — so `parent` is rebound here and everything
+            # downstream (writer root, no-op check, paired bootstrap) pairs
+            # against the tree the ablation actually measured.
+            parent = refine_target
+            ablations = run_ablations(
+                refine_target, refine_target.local_best_score,
+                codegen_mod=codegen,
+                stage_fn=_apply_diff_and_stage,
+                apply_diff_fn=_apply_diff_to_dir,
+                data_dir=DATA_DIR,
+                counters=counters,
+            )
+            component = pick_weakest_component(ablations)
+            if component is not None:
+                abl = ABLATIONS[component]
+                with open(os.path.join(refine_target.code_dir, abl.file)) as fh:
+                    component_source = fh.read()
+                if verbose:
+                    print(f"  weakest component: {component} "
+                          f"(deltas {ablations})")
+                prior_refines = _prior_refines_for_component(component)
+                hypothesis = llm.refine(component, component_source, ablations,
+                                        list(iter_history), recent_improvement,
+                                        prior_refines)
+                counters.bump("proposals")
+                counters.bump("tokens", 800)
+                diag = {"component": component,
+                        "bottleneck": f"weakest by ablation: {component}",
+                        "ablation_deltas": ablations,
+                        "improvement_score": recent_improvement}
+                candidates = [Node(
+                    id=_new_id(), parent_id=refine_target.id,
+                    code_path=refine_target.code_path,
+                    code_dir=refine_target.code_dir,
+                    operation="refine",
+                    diagnosis=diag,
+                    hypothesis=hypothesis,
+                )]
+                improves_since_refine = 0
+            elif verbose:
+                # Every ablation failed to stage or run: no evidence either
+                # way, so fall through to a normal improve rather than
+                # refining a component picked at random.
+                print("  no ablation produced a delta — falling back to improve")
+
+        if not candidates:
+            parent = select(open_nodes)
+            diag, candidates = _build_improve_candidates(
+                parent, diag_llm=llm, memory=memory,
+                counters=counters, history=history,
+                iter_history=iter_history,
+                improvement_score=recent_improvement,
+                verbose=verbose,
+            )
+            improves_since_refine += 1
+
+        parent.n_visits += 1
 
         if not candidates:
             parent.status = "closed"
@@ -372,22 +871,39 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             if parent in open_nodes:
                 open_nodes.remove(parent)
             # Record even here, so dedup-only iterations aren't a gap in the file.
-            _record_iteration(it, [], promoted_ids)
+            _record_iteration(it, [], promoted_ids, global_best_at_start)
             continue
 
         # 3. write → diff-hash dedup → gate (hard) → audit (advisory) → partial run
-        for c in candidates:
-            diff = codegen.write_fix(c.hypothesis, target_component=diag["component"])
+        def _attempt(c: Node, semantic_feedback: str | None = None) -> str:
+            """One write→stage→triage-run pass. Mutates c; returns why it ended.
+
+            Split out of the loop so a candidate rejected as a no-op can be
+            re-written once with that fact fed back, instead of being recorded as
+            a refuted mechanism it never actually implemented.
+            """
+            if c.operation == "refine":
+                # Route through the registry so the component name resolves to
+                # the file it actually lives in. "capacity" and
+                # "regularization" both mean baseline.py, which write_fix's
+                # substring heuristic gets right only by accident.
+                diff = codegen.write_refine(
+                    c.hypothesis, component=diag["component"],
+                    root=parent.code_dir,
+                    semantic_feedback=semantic_feedback)
+            else:
+                diff = codegen.write_fix(c.hypothesis,
+                                         target_component=diag["component"],
+                                         root=parent.code_dir,
+                                         semantic_feedback=semantic_feedback)
             counters.bump("tokens", 800)
 
             # Diff-hash dedup: skip if this exact diff has already been tried.
             dh = _diff_hash(diff)
             if dh in seen_diff_hashes:
-                c.status = "closed"
-                c.evidence_type = "refuted_under_context"
                 if verbose:
                     print(f"  {c.id} skipped: identical diff already tried ({dh[:8]})")
-                continue
+                return "dedup"
             seen_diff_hashes.add(dh)
 
             if SHOW_DIFFS and verbose:
@@ -398,11 +914,9 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             # Hard gate: deterministic static scan.
             gate = codegen.pre_execution_gate(diff)
             if not gate["pass"]:
-                c.status = "closed"
-                c.evidence_type = "failed_implementation"
                 if verbose:
                     print(f"  {c.id} blocked by gate: {gate['reasons']}")
-                continue
+                return "gate"
 
             # Audit is ADVISORY — concerns logged to diagnosis, do not veto.
             # The blind LLM auditor hallucinates leaks from thin context; the
@@ -420,13 +934,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
 
             # Apply the diff to a per-candidate staged directory so execute()
             # actually runs the MODIFIED code, not the pristine baseline.
-            cand_dir = _apply_diff_and_stage(diff, root=".", candidate_id=c.id)
+            cand_dir = _apply_diff_and_stage(diff, root=parent.code_dir,
+                                             candidate_id=c.id)
             if cand_dir is None:
-                c.status = "closed"
-                c.evidence_type = "failed_implementation"
                 if verbose:
                     print(f"  {c.id} patch failed to apply (malformed diff)")
-                continue
+                return "patch"
+            c.code_dir = cand_dir
             c.code_path = os.path.join(cand_dir, "baseline.py")
 
             # 3a. Triage run — one seed, short cap.
@@ -436,22 +950,74 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             counters.bump("triage_runs")
             counters.bump_scorer("valid_search")
 
-            if res["status"] != "ok":
-                repair = codegen.debug_and_retry(c.code_path, res["logs"])
+            while res["status"] != "ok" and c.fix_attempts < MAX_FIX_ATTEMPTS:
+                c.fix_attempts += 1
+                repair = codegen.debug_and_retry(c.code_path, res["logs"],
+                                                 root=cand_dir)
                 if repair.get("is_semantic_change"):
                     counters.bump("semantic_retries")
+                repair_diff = (repair.get("code_diff") or "").strip()
+                if not repair_diff:
+                    break
+                pre_hash = _dir_sha256(cand_dir)
+                if not _apply_diff_to_dir(repair_diff, cand_dir):
+                    break
+                if _dir_sha256(cand_dir) == pre_hash:
+                    # Patch reported success but no file changed — a common
+                    # failure mode when the diff targeted the wrong path or had
+                    # only empty hunks.
+                    break
                 res = codegen.execute(c.code_path, seed=0, split="valid_search",
                                       wallclock_cap_seconds=120,
                                       root=cand_dir, data_dir=DATA_DIR)
                 counters.bump("triage_runs")
                 counters.bump_scorer("valid_search")
-                if res["status"] != "ok":
-                    c.status = "closed"
-                    c.evidence_type = "failed_implementation"
-                    continue
+            if res["status"] != "ok":
+                return "exec"
 
             c.partial_scores.append(res["metrics"]["primary"])
+            c.per_seed_primary[0] = res["metrics"]["primary"]
             c.per_user_by_seed[0] = res["metrics"].get("per_user", {})
+            return "ok"
+
+        #: How a failed _attempt is recorded. A no-op is NOT one of these — it
+        #: ran fine and gets its own evidence type, because "the writer missed"
+        #: and "the mechanism doesn't work" call for completely different fixes.
+        _ATTEMPT_EVIDENCE = {"dedup": "refuted_under_context",
+                             "gate": "failed_implementation",
+                             "patch": "failed_implementation",
+                             "exec": "failed_implementation"}
+
+        for c in candidates:
+            outcome = _attempt(c)
+            if outcome == "ok" and _is_no_op(c, parent, seed=0):
+                # Applied, passed the gate, ran to completion — and reproduced
+                # the parent's per-user scores exactly, so the executed code path
+                # was never touched. Rewrite once with that fed back.
+                if verbose:
+                    print(f"  {c.id} scored identically to parent "
+                          f"({c.per_seed_primary[0]:.6f}) — no-op, rewriting")
+                counters.bump("no_op_rewrites")
+                c.partial_scores.clear()
+                c.per_seed_primary.clear()
+                c.per_user_by_seed.clear()
+                outcome = _attempt(c, semantic_feedback=codegen.NO_SEMANTIC_CHANGE)
+                if outcome == "ok" and _is_no_op(c, parent, seed=0):
+                    outcome = "no_op"
+                elif outcome == "dedup":
+                    # The rewrite came back byte-identical: nothing new to run.
+                    outcome = "no_op"
+
+            if outcome == "no_op":
+                c.status = "closed"
+                c.evidence_type = "no_op"
+                if verbose:
+                    print(f"  {c.id} no_op: rewrite never changed the executed path")
+                continue
+            if outcome != "ok":
+                c.status = "closed"
+                c.evidence_type = _ATTEMPT_EVIDENCE[outcome]
+                continue
 
         # 4. triage-rank, run full seeds on survivors
         survivors = rank([c for c in candidates if c.status == "open"],
@@ -466,35 +1032,62 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 counters.bump_scorer("valid_search")
                 if r["status"] == "ok":
                     c.seeds_run.append(seed)
-                    c.local_best_score = max(c.local_best_score, r["metrics"]["primary"])
+                    c.per_seed_primary[seed] = r["metrics"]["primary"]
                     c.per_user_by_seed[seed] = r["metrics"].get("per_user", {})
+            c.local_best_score = _scalar_primary(c)
 
             mean_d, p_pos, lower_95 = bootstrap_delta(
                 c.per_user_by_seed, parent.per_user_by_seed)
-            upper_bound = mean_d + 2 * abs(mean_d - lower_95)
+            c.mean_delta, c.p_positive, c.lower_95 = mean_d, p_pos, lower_95
 
-            if should_continue_locally(mean_d, p_pos, upper_bound):
+            if should_continue_locally(mean_d, p_pos, lower_95):
                 if c not in open_nodes:
                     open_nodes.append(c)
 
             # 5. Promotion — sealed valid_confirm scorer, only when trigger clears.
-            if c.local_best_score > global_best + 0.003:
+            #
+            # The trigger is the PAIRED bootstrap computed just above (significant
+            # vs the parent, over thousands of users) plus a scalar check that the
+            # candidate clears the champion. It used to be
+            # `local_best_score > global_best + 0.003`, a naive compare between
+            # two noisy maxima with a bar four times the largest delta this
+            # search has ever produced — so a confirm query was never spent.
+            if (p_pos >= PROMOTE_TRIGGER_P_POS and lower_95 > 0
+                    and c.local_best_score > global_best):
                 r_conf = codegen.execute(c.code_path, seed=0, split="valid_confirm",
                                          wallclock_cap_seconds=600,
                                          root=cand_dir, data_dir=DATA_DIR)
                 counters.bump_scorer("valid_confirm")
                 if r_conf["status"] == "ok":
-                    confirm_delta = r_conf["metrics"]["primary"] - global_best
-                    confirm_lower = confirm_delta - 0.002
-                    if should_promote_globally(confirm_delta, confirm_lower):
+                    c.confirm_primary = r_conf["metrics"]["primary"]
+                    if confirm_baseline is None:
+                        confirm_baseline = _measure_confirm_baseline(
+                            counters, cache_path=confirm_baseline_path,
+                            verbose=verbose)
+                    # Paired against the BASELINE ON THE SAME SPLIT. Comparing a
+                    # valid_confirm primary against a valid_search global_best,
+                    # as this did, mixes the real effect with the level
+                    # difference between two different splits.
+                    conf_mean, _conf_p, conf_lower = bootstrap_delta(
+                        {0: r_conf["metrics"].get("per_user", {})},
+                        confirm_baseline)
+                    if should_promote_globally(conf_mean, conf_lower):
                         c.status = "promoted"
                         c.evidence_type = "invariant"
-                        global_best = r_conf["metrics"]["primary"]
+                        # global_best stays on valid_search — the currency the
+                        # whole search ranks and reports in. The confirm run is
+                        # the gate, not the scoreboard.
+                        global_best = c.local_best_score
                         global_best_node = c
                         history.append(global_best)
                         promoted_ids.append(c.id)
                         if verbose:
-                            print(f"[promote] {c.id} → {global_best:.4f}")
+                            print(f"[promote] {c.id} → {global_best:.4f} "
+                                  f"(valid_confirm paired delta {conf_mean:+.4f}, "
+                                  f"lower95 {conf_lower:+.4f})")
+                    elif verbose:
+                        print(f"  {c.id} confirm failed: paired delta "
+                              f"{conf_mean:+.4f} lower95 {conf_lower:+.4f}")
 
             memory.record(EvidenceEntry(
                 fingerprint=_fingerprint(c.hypothesis),
@@ -509,9 +1102,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 evidence_type=c.evidence_type or "inconclusive",
                 note=c.hypothesis.get("mechanism", "")))
 
-        _record_iteration(it, candidates, promoted_ids)
+        _record_iteration(it, candidates, promoted_ids, global_best_at_start)
 
-        if local_plateau(history):
+        # iter_history, not history: `history` only grows on promotion, so it
+        # is almost always shorter than local_plateau()'s N+1 minimum and the
+        # stop condition never fires. iter_history is the per-iteration
+        # running-best trajectory the plateau rule is defined against.
+        if local_plateau(iter_history):
             if verbose:
                 print(f"[stop] local plateau at iter {it}")
             break
@@ -534,11 +1131,37 @@ if __name__ == "__main__":
 
     SHOW_DIFFS = args.show_diffs
 
+    run_kwargs = {}
     if args.mock:
         from .mocks import harness as _h, llm as _l, codegen as _c
         harness, llm, codegen = _h, _l, _c
 
-    result = run(max_iters=args.max_iters)
+        # A mocked run gets its own state dir. Two reasons, both load-bearing:
+        #
+        # 1. Correctness. With the shared cache the mock reads the REAL
+        #    root_baseline.json, whose 10894 measured user ids share nothing
+        #    with the mock's u0..u9 — so paired_user_deltas returns [] for
+        #    every candidate, mean_delta is 0.0, should_continue_locally never
+        #    passes, and the tree cannot grow past the root. The run stalls at
+        #    iteration 3 and nothing past it is exercisable. This is the same
+        #    trap orchestrator/tests/test_smoke.py::_isolated_caches guards.
+        # 2. Isolation. A mocked run used to overwrite the live progress.json,
+        #    nodes.jsonl and memory.json an overnight run had produced.
+        mock_state = os.path.join("orchestrator", "_state", "mock")
+        os.makedirs(mock_state, exist_ok=True)
+        NODES_LOG_PATH = os.path.join(mock_state, "nodes.jsonl")
+        ablation_harness.ABLATIONS_LOG_PATH = os.path.join(mock_state,
+                                                           "ablations.jsonl")
+        run_kwargs = {
+            "progress_path": os.path.join(mock_state, "progress.json"),
+            "root_baseline_path": os.path.join(mock_state, "root_baseline.json"),
+            "confirm_baseline_path": os.path.join(mock_state,
+                                                  "confirm_baseline.json"),
+            "memory_path": os.path.join(mock_state, "memory.json"),
+        }
+        print(f"[mock] state dir: {mock_state}")
+
+    result = run(max_iters=args.max_iters, **run_kwargs)
     print("\n=== final ===")
     print("best:", result["global_best"])
     print("history:", result["history"])

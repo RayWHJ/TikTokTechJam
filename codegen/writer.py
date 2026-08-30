@@ -8,7 +8,7 @@ training loop." The relevant existing file's content is passed to the model as
 context, together with hypothesis['mechanism'] and hypothesis['implementation_sketch'].
 """
 from __future__ import annotations
-import difflib, os, re, shutil, subprocess, tempfile
+import ast, difflib, os, re, shutil, subprocess, tempfile
 
 from .diffnorm import normalize_unified_diff
 
@@ -71,6 +71,52 @@ def _extract_python(text: str) -> str | None:
     return max(blocks, key=len) if blocks else None
 
 
+#: Message fed back to the model when its rewrite changed no executable code.
+NO_SEMANTIC_CHANGE = ("the rewrite changed only comments, docstrings or "
+                      "formatting — the executable code is byte-identical, so "
+                      "this candidate would score exactly the same as its parent")
+
+
+#: AST nodes whose leading string literal is a docstring, not a statement.
+_DOCSTRING_OWNERS = (ast.Module, ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef)
+
+
+def _strip_docstrings(tree: ast.AST) -> ast.AST:
+    """Drop every docstring in place, so prose changes read as no change."""
+    for node in ast.walk(tree):
+        if not isinstance(node, _DOCSTRING_OWNERS) or not node.body:
+            continue
+        first = node.body[0]
+        if (isinstance(first, ast.Expr) and isinstance(first.value, ast.Constant)
+                and isinstance(first.value.value, str) and len(node.body) > 1):
+            del node.body[0]
+    return tree
+
+
+def changes_executable_code(original: str, rewritten: str) -> bool:
+    """True if `rewritten` differs from `original` in code that actually runs.
+
+    Compares ASTs with docstrings stripped, so added or edited comments,
+    docstrings, blank lines and reformatting all read as "no change". This is the
+    cheap half of the no-op guard: it catches the "helpfully annotated the file
+    and changed nothing" rewrite for the price of two ast.parse calls, before a
+    gate + audit + sandbox run that can only reproduce the parent's score.
+
+    It cannot catch a rewrite that adds a helper function and never calls it —
+    the AST does change there. The driver's empirical check (candidate per-user
+    scores identical to the parent's) is what catches that half.
+
+    Unparseable input returns True: deciding no-op-ness is not this function's
+    job, and a syntax error should surface from the sandbox with a traceback.
+    """
+    try:
+        old_tree = _strip_docstrings(ast.parse(original))
+        new_tree = _strip_docstrings(ast.parse(rewritten))
+    except SyntaxError:
+        return True
+    return ast.dump(old_tree) != ast.dump(new_tree)
+
+
 def rewrite_to_diff(rewritten: str, original: str, file_name: str) -> tuple[str, str]:
     """Turn a full-file rewrite into a unified diff. Returns (diff, error).
 
@@ -96,6 +142,8 @@ def rewrite_to_diff(rewritten: str, original: str, file_name: str) -> tuple[str,
         old_lines, new_lines, f"a/{file_name}", f"b/{file_name}", n=3))
     if not diff.strip():
         return "", "rewrite is identical to the original (no change made)"
+    if not changes_executable_code(original, rewritten):
+        return "", NO_SEMANTIC_CHANGE
     return diff, ""
 
 
@@ -133,7 +181,8 @@ def diff_applies(diff: str, file_name: str, root: str = ".") -> tuple[bool, str]
 
 def write_fix(hypothesis: dict, target_component: str, *,
               client: LLMClient | None = None, root: str = ".",
-              max_attempts: int = 3) -> str:
+              max_attempts: int = 3,
+              semantic_feedback: str | None = None) -> str:
     """Generate a code diff/patch (as text) implementing `hypothesis`.
 
     Parameters
@@ -149,7 +198,13 @@ def write_fix(hypothesis: dict, target_component: str, *,
         Model client. Defaults to the process client (offline fake backend unless
         a real backend is configured). Inject the real one from the orchestrator.
     root : str
-        Repo root containing baseline.py / data.py (default: current dir).
+        Repo root containing baseline.py / data.py (default: current dir). Pass
+        the PARENT node's staged directory to build on its modifications rather
+        than re-editing the pristine baseline.
+    semantic_feedback : str, optional
+        Why the caller rejected a previous attempt on semantic (not syntactic)
+        grounds — e.g. it ran but scored bit-identically to the parent. Included
+        in the prompt so the retry is aimed at the executed code path.
 
     Returns
     -------
@@ -164,6 +219,8 @@ def write_fix(hypothesis: dict, target_component: str, *,
 
     content = _read_root_file(file_name, root)
     user = prompts.build_writer_user(file_name, content, hypothesis, target_component)
+    if semantic_feedback:
+        user += prompts.build_semantic_repair_suffix(file_name, semantic_feedback)
 
     # Validate-and-repair. The prompt asks for a full-file rewrite, which we diff
     # locally; the retry is only worth spending because the message changes (the
@@ -197,3 +254,28 @@ def write_fix(hypothesis: dict, target_component: str, *,
     # Give up and return the last attempt: the caller's staging step will reject
     # it and log the reason, which keeps the failure visible in progress.json.
     return diff
+
+
+def write_refine(hypothesis: dict, component: str, *,
+                 client: LLMClient | None = None, root: str = ".",
+                 max_attempts: int = 3,
+                 semantic_feedback: str | None = None) -> str:
+    """A refine is a write_fix scoped to one component.
+
+    We delegate to write_fix after resolving the component to the writer's
+    existing target_component vocabulary. Going through the registry rather
+    than passing the component name straight to _is_feature_component makes
+    the file routing explicit: "regularization" and "capacity" both live in
+    baseline.py, which the substring heuristic gets right only by accident.
+
+    The mechanism/implementation_sketch fields in `hypothesis` come from the
+    refiner persona (see personas.py). `semantic_feedback` is threaded through
+    so the driver's no-op rewrite retry works for refine candidates too.
+    """
+    from .ablations import ABLATIONS
+    abl = ABLATIONS.get(component)
+    if abl is None:
+        raise ValueError(f"unknown component {component!r}")
+    return write_fix(hypothesis, target_component=abl.target,
+                     client=client, root=root, max_attempts=max_attempts,
+                     semantic_feedback=semantic_feedback)

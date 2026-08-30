@@ -92,15 +92,44 @@ class FakeBackend:
         # emits — robust, since both system prompts mention the word "feature".
         return "file to edit: data.py" in user.lower()
 
-    @staticmethod
-    def _real_unified_diff(user: str, file_name: str, note_lines: list[str]) -> str | None:
+    #: Real, gate-clean, single-token edits the fake applies to the echoed file,
+    #: tried in order. Each one changes a value the training path actually reads,
+    #: so the rewrite is a genuine semantic change rather than an annotation.
+    #: Prepending a comment is NOT enough: writer.changes_executable_code rejects
+    #: a rewrite whose AST is unchanged, which is precisely what a comment-only
+    #: echo is — and what made 19 of 33 scored candidates in the first overnight
+    #: run report the baseline's primary to the last bit.
+    _SEMANTIC_EDITS = {
+        "baseline.py": [("l2=1e-6", "l2=1e-5")],       # FM.__init__ regularization
+        "data.py": [("n=10", "n=20")],                 # _bucket_edges bucket count
+    }
+
+    @classmethod
+    def _apply_semantic_edit(cls, content: str, file_name: str) -> str:
+        """Make one real change to `content`, or fall back to an inert constant.
+
+        The fallback keeps the writer's full-file path exercisable if the anchors
+        below ever drift out of baseline.py / data.py. It is AST-different (so it
+        clears the static no-op guard) but runtime-inert, which models the OTHER
+        real failure mode — a rewrite that adds something and never calls it,
+        caught by the driver's empirical per-user check instead.
+        tests/test_improvement_chain.py asserts the anchor path is the one firing.
+        """
+        for old, new in cls._SEMANTIC_EDITS.get(file_name, []):
+            if old in content:
+                return content.replace(old, new, 1)
+        return content + "\n_FAKE_BACKEND_MARKER = True\n"
+
+    @classmethod
+    def _real_unified_diff(cls, user: str, file_name: str,
+                           note_lines: list[str]) -> str | None:
         """Return a full-file rewrite, matching the writer's real contract.
 
         The illustrative diffs below use pseudo-hunk headers (`@@ class FM`), so
         they are not patches at all and writer.diff_applies rightly rejects them.
-        Echoing back the real file content from the prompt — plus a comment —
-        exercises the writer's full-file path, and it cannot drift when
-        baseline.py / data.py change.
+        Echoing back the real file content from the prompt — plus a comment AND
+        one real edit — exercises the writer's full-file path, and it cannot
+        drift when baseline.py / data.py change.
         """
         m = re.search(r"```python\s*\n(.*?)```", user, re.DOTALL)
         if not m:
@@ -108,6 +137,7 @@ class FakeBackend:
         content = m.group(1)
         if len(content.splitlines()) < 3:
             return None
+        content = cls._apply_semantic_edit(content, file_name)
         return "```python\n" + "\n".join(note_lines) + "\n" + content + "```\n"
 
     def _fake_diff(self, system: str, user: str) -> str:
@@ -161,6 +191,20 @@ class FakeBackend:
             ''')
 
     def _fake_debug(self, user: str) -> str:
+        """Return a full-file rewrite, matching DEBUG_SYSTEM's real contract.
+
+        Same reasoning as _real_unified_diff above: the illustrative diff below
+        uses a bare `@@` header, so it is not a patch and debug's validation
+        rightly rejects it — which left the offline fake unable to produce a
+        usable repair at all. Echoing the file from the prompt plus one real edit
+        cannot drift when baseline.py changes. The 3-line floor is not applied
+        here: a repair target may legitimately be a tiny file.
+        """
+        m = re.search(r"```python\s*\n(.*?)```", user, re.DOTALL)
+        if m and m.group(1).strip():
+            content = self._apply_semantic_edit(m.group(1), "baseline.py")
+            return ("```python\n# fake repair: crash fixed, mechanism untouched.\n"
+                    + content + "```\n")
         return textwrap.dedent('''\
             ```diff
             --- a/baseline.py

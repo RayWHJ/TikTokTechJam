@@ -129,6 +129,27 @@ line of the original must be present unless your change removes it. Do not
 abbreviate, do not use `...`, and do not emit a diff."""
 
 
+def build_semantic_repair_suffix(file_name: str, reason: str) -> str:
+    """Appended when a previous attempt was rejected for changing nothing that RUNS.
+
+    A distinct message from build_diff_repair_suffix: there the patch was
+    unusable, here it applied cleanly and produced a candidate that scored
+    bit-identically to its parent. Saying "aim at the executed code path" is the
+    only instruction that changes the outcome, since the model is at
+    temperature 0 and would otherwise re-emit the same annotated file.
+    """
+    return f"""
+
+Your previous answer was REJECTED as a NO-OP: {reason.strip()}
+
+Adding comments, docstrings, type hints, or an unreferenced helper function does
+NOT count as implementing the mechanism. Change code that {file_name} actually
+executes on the training path — a value that is read, a term in the loss, a
+field in the feature list, a call site. Name the function you are modifying in a
+comment on the changed line, then return the COMPLETE updated {file_name} in one
+```python block."""
+
+
 def build_debug_user(file_name: str, file_content: str, error_context: str) -> str:
     return f"""\
 File: {file_name}

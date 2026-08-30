@@ -163,6 +163,29 @@ def validate_hypothesis_item(parsed: Any) -> Dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# refine()  — MLE-STAR component refinement
+# ---------------------------------------------------------------------------
+
+#: A refinement is a hypothesis plus the component it is scoped to. Named
+#: validate_refinement rather than validate_hypothesis so it can't be confused
+#: with validate_hypothesis_item, which rejects the extra `component` key.
+_REFINEMENT_KEYS = _HYPOTHESIS_KEYS + ["component"]
+
+
+def validate_refinement(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _REFINEMENT_KEYS)
+    _reject_unknown_keys(d, _REFINEMENT_KEYS)
+    return {
+        "mechanism": _check_str(d, "mechanism"),
+        "success_criterion_paired": _check_success_criterion(
+            _check_str(d, "success_criterion_paired")),
+        "implementation_sketch": _check_str(d, "implementation_sketch"),
+        "component": _check_str(d, "component"),
+    }
+
+
 def validate_hypothesis_list(parsed: Any, expected_count: int) -> List[Dict]:
     if not isinstance(parsed, list):
         raise ValueError(f"Expected a JSON array of hypotheses, got {type(parsed).__name__}.")

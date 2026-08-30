@@ -32,8 +32,29 @@ def bootstrap_delta(cand_per_user_by_seed, parent_per_user_by_seed,
     lower_95 = boot_means[int(0.05 * n_boot)]
     return (mean_delta, p_pos, lower_95)
 
-def should_continue_locally(mean_delta, p_positive, upper_bound, margin=0.002):
-    return p_positive > 0.8 and upper_bound > margin
+def should_continue_locally(mean_delta, p_positive, lower_95, margin=0.0):
+    """Keep exploring below this candidate?
 
-def should_promote_globally(confirm_mean_delta, confirm_lower_95, margin=0.002):
+    A proper one-sided test: the paired per-user delta must be positive at the
+    95% lower bound. The third argument is the bootstrap LOWER bound.
+
+    It used to be an `upper_bound` built as `mean_d + 2*abs(mean_d - lower_95)`
+    and compared against margin=0.002. Work a realistic case: mean_delta=0.0007,
+    lower_95=0.0002 gives upper_bound=0.0017 < 0.002, so a genuinely-positive
+    candidate FAILED and never entered open_nodes — it could never become a
+    parent, so nothing could ever build on it. The paired bootstrap runs over
+    thousands of users and has ample power to resolve 0.0007, so requiring
+    significance rather than a hard 0.002 effect size is the tighter test, not
+    the looser one.
+    """
+    return p_positive > 0.8 and lower_95 > margin
+
+def should_promote_globally(confirm_mean_delta, confirm_lower_95, margin=0.0005):
+    """Promote to global champion?
+
+    Both arguments must come from a PAIRED bootstrap on valid_confirm against
+    the same split's baseline. The margin is 0.0005 rather than 0.002: nothing
+    this search has produced clears 0.002, and a significant +0.001 confirmed on
+    a sealed split is a real win worth promoting.
+    """
     return confirm_mean_delta > margin and confirm_lower_95 > 0
