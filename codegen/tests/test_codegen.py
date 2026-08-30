@@ -116,6 +116,111 @@ def test_gate_allows_auxiliary_as_loss_target():
     assert res["pass"] is True, res["reasons"]
 
 
+# --------------------------------------------------------------------------- #
+#  gate rule 5 — RNG stream isolation                                          #
+# --------------------------------------------------------------------------- #
+# Why this rule exists: orchestrator/promotion.py pairs a candidate's per-user
+# scores against its parent's seed by seed, and that pairing only cancels noise
+# while both runs consume the same draws in the code they share. run_fm's
+# `rng = np.random.default_rng(seed)` feeds exactly one consumer, the epoch
+# permutation. A candidate that draws from it advances the stream, so every
+# later epoch shuffle differs from the parent's at the same seed — inflating
+# paired variance in a way that looks exactly like the +0.001 effect the search
+# is trying to resolve, against a 0.0012 paired noise floor.
+def test_gate_allows_a_separately_seeded_generator():
+    """The legal form. A candidate that needs negative samples must be able to
+    get them, or the rule just blocks a whole direction."""
+    diff = textwrap.dedent("""\
+        +    neg_rng = np.random.default_rng(seed + 1000)
+        +    neg = neg_rng.integers(0, n_items, size=len(ytr))
+        """)
+    res = codegen.pre_execution_gate(diff)
+    assert res["pass"] is True, res["reasons"]
+
+
+@pytest.mark.parametrize("line", [
+    "    idx = np.random.permutation(len(ytr))",
+    "    neg = np.random.randint(0, n_items, size=B)",
+    "    j = np.random.choice(items, size=B)",
+    "    mask = np.random.rand(B) < 0.5",
+    "    np.random.seed(seed)",
+])
+def test_gate_blocks_the_legacy_global_np_random_api(line):
+    res = codegen.pre_execution_gate("+" + line + "\n")
+    assert res["pass"] is False
+    assert any("np.random." in r for r in res["reasons"])
+    # The reason must name the offending line, so run.log says what to fix.
+    assert any(line.strip() in r for r in res["reasons"])
+
+
+@pytest.mark.parametrize("line", [
+    "    neg = rng.integers(0, n_items, size=len(ytr))",
+    "    j = rng.choice(neg_pool, size=B)",
+    "    drop = rng.random(self.V.shape) < 0.1",
+    "    sub = rng.permutation(n_pairs)[:B]",
+    "    rng.shuffle(pair_idx)",
+])
+def test_gate_blocks_drawing_from_the_epoch_permutation_generator(line):
+    res = codegen.pre_execution_gate("+" + line + "\n")
+    assert res["pass"] is False
+    assert any("common-random-numbers" in r for r in res["reasons"])
+    assert any(line.strip() in r for r in res["reasons"])
+
+
+def test_gate_allows_run_fms_own_epoch_permutation():
+    """`idx = rng.permutation(len(ytr))` IS the legitimate single consumer of
+    that stream. It is also baseline.py line 138 verbatim, and the driver diffs
+    whole rewritten files — so any candidate that touches the epoch loop puts
+    this untouched line into the diff as an added line. Blocking it would reject
+    exactly the loss-change candidates this rule exists to make measurable."""
+    diff = textwrap.dedent("""\
+        +    for ep in range(1, epochs + 1):
+        +        idx = rng.permutation(len(ytr))
+        +        losses = [m.step(Xtr[idx[i:i + bs]], ytr[idx[i:i + bs]]) for i in ...]
+        """)
+    res = codegen.pre_execution_gate(diff)
+    assert res["pass"] is True, res["reasons"]
+
+
+def test_gate_allows_a_relocated_baseline_rng_line():
+    """A line that is both removed and re-added is not new code, just moved.
+    Without this the gate would block reindentation of the epoch loop."""
+    diff = textwrap.dedent("""\
+        --- a/baseline.py
+        +++ b/baseline.py
+        @@
+        -    rng = np.random.default_rng(seed)
+        +    rng = np.random.default_rng(seed)
+        +    neg_rng = np.random.default_rng(seed + 1000)
+        """)
+    res = codegen.pre_execution_gate(diff)
+    assert res["pass"] is True, res["reasons"]
+
+
+def test_gate_still_blocks_a_new_rng_draw_alongside_a_legal_one():
+    """Adding a correct generator does not license drawing from the shared one."""
+    diff = textwrap.dedent("""\
+        +    neg_rng = np.random.default_rng(seed + 1000)
+        +    pos = rng.integers(0, len(ytr), size=B)
+        """)
+    res = codegen.pre_execution_gate(diff)
+    assert res["pass"] is False
+    assert any("rng.integers" in r for r in res["reasons"])
+
+
+def test_rng_constraint_reaches_both_prompt_surfaces():
+    """The gate is the backstop; the prompts are what keep it from firing. A
+    rule stated only in the gate costs a wasted generation every time."""
+    from llm_calls import personas
+    from codegen import prompts
+    for text in (personas._DATASET_CONTEXT, prompts._RUNTIME_RULES):
+        assert "default_rng(seed + 1000)" in text
+        assert "epoch permutation" in text
+    # And it must reach the writer prompts the model actually receives.
+    assert "default_rng(seed + 1000)" in prompts.WRITER_SYSTEM_MODEL
+    assert "default_rng(seed + 1000)" in prompts.WRITER_SYSTEM_DATA
+
+
 def test_gate_empty_diff_blocks():
     assert codegen.pre_execution_gate("")["pass"] is False
     assert codegen.pre_execution_gate("   \n")["pass"] is False

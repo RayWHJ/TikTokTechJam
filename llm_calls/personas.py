@@ -38,6 +38,16 @@ runnable code because they ignored these limits:
   cost is the entire budget, so an O(users x items) or per-row-Python-loop
   mechanism will simply time out.
 - No external data, no pretrained weights, no downloads.
+- ANY new source of randomness — negative sampling, dropout masks, row
+  subsampling, tie-breaking — must take its OWN generator,
+  np.random.default_rng(seed + 1000). It must never draw from the existing
+  `rng` that run_fm uses for the epoch permutation, and never from
+  np.random.* directly. The orchestrator scores a candidate by pairing its
+  per-user results against its parent's SEED BY SEED, which only cancels
+  noise while the two runs consume the same draws in the code they share.
+  One extra draw from `rng` shifts every later epoch shuffle, the training
+  trajectories decorrelate, and the inflated paired variance is
+  indistinguishable from a real effect. A static gate rejects the diff.
 
 MODELS ALREADY IN THE REPO:
 - run_fm in baseline.py — the champion. Numpy FM, k=16, Adam, pointwise

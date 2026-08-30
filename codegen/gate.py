@@ -13,7 +13,11 @@ Rules (block if the added code):
      marker nearby;
   3. imports external pretrained weights or external datasets / downloads;
   4. feeds a same-row AUXILIARY_SIGNALS value into the model as an INPUT feature
-     array rather than only as a loss target (ambiguous usage also blocks).
+     array rather than only as a loss target (ambiguous usage also blocks);
+  5. draws randomness from the legacy global `np.random.*` API, or from the
+     generator named `rng` that carries run_fm's epoch permutation — either one
+     breaks the common-random-numbers pairing the orchestrator's paired
+     bootstrap rests on.
 
 Returns {"pass": bool, "reasons": list[str]}.
 """
@@ -43,6 +47,25 @@ def _added_lines(code_diff: str) -> list[tuple[int, str]]:
             continue
         if l.startswith("+"):
             out.append((i, l[1:]))
+    return out
+
+
+def _removed_lines(code_diff: str) -> set[str]:
+    """The stripped text of every REMOVED line in the diff.
+
+    Used only by rule 5, to tell a genuinely new random draw from one of the
+    baseline's own lines that merely moved. The driver builds its diffs by
+    rewriting a whole file and diffing the result, so a line the writer did not
+    touch can still surface as a `+` when the hunk around it shifts. Rules 1-4
+    deliberately do NOT get this exemption: a leaking line is a leaking line
+    whether or not it also appears as removed.
+    """
+    out = set()
+    for l in code_diff.splitlines():
+        if l.startswith("---"):
+            continue
+        if l.startswith("-"):
+            out.add(l[1:].strip())
     return out
 
 
@@ -172,6 +195,68 @@ def _check_auxiliary(added: list[tuple[int, str]]) -> list[str]:
 
 
 # --------------------------------------------------------------------------- #
+#  Rule 5 — randomness that breaks common-random-numbers pairing               #
+# --------------------------------------------------------------------------- #
+# orchestrator/promotion.py::bootstrap_delta pairs a candidate's per-user scores
+# against its PARENT's, seed by seed. That pairing only reduces variance if the
+# two runs consume the same random draws wherever they share code. In
+# baseline.py::run_fm the model init takes its own generator
+# (FM(..., seed=seed)) and the epoch shuffle takes another
+# (rng = np.random.default_rng(seed)), whose sole consumer is
+# `idx = rng.permutation(len(ytr))`. A candidate that adds negative sampling and
+# draws from that same `rng` advances the stream, so from the first extra draw
+# onward parent and candidate see different epoch shuffles at the same seed.
+# The whole training trajectory decorrelates, paired variance inflates, and the
+# inflation looks exactly like a real effect.
+#
+# The legacy global API is worse still: np.random.* draws from process-global
+# state, so the sequence depends on import order and on how many draws anything
+# else happened to make.
+#
+# Legal form: a NEW named generator, seeded off the run seed but offset —
+#     neg_rng = np.random.default_rng(seed + 1000)
+_NP_RANDOM_LEGACY = re.compile(r"\bnp(?:\.|umpy\.)random\s*\.\s*(\w+)")
+_RNG_DRAW = re.compile(
+    r"\brng\s*\.\s*(integers|choice|permutation|permuted|shuffle|random|"
+    r"normal|uniform|standard_normal|binomial|poisson|beta|gamma|"
+    r"exponential|bytes|spawn)\b")
+# run_fm's own epoch shuffle, the one legitimate consumer of the `rng` stream.
+# Exempted because a candidate that changes the loss almost always rewrites the
+# epoch loop, which puts this untouched baseline line into the diff as an added
+# line — blocking it would reject exactly the class of candidate this rule
+# exists to make measurable.
+_EPOCH_PERMUTATION = re.compile(r"\brng\s*\.\s*permutation\s*\(\s*len\s*\(")
+
+
+def _check_rng_isolation(added: list[tuple[int, str]],
+                         removed: set[str]) -> list[str]:
+    reasons = []
+    for _, raw in added:
+        code = _strip_inline_comment(raw)
+        if raw.strip() in removed:
+            continue        # not new code — the same line is also removed
+        m = _NP_RANDOM_LEGACY.search(code)
+        if m and m.group(1) != "default_rng":
+            reasons.append(
+                f"legacy global randomness `np.random.{m.group(1)}` — draws "
+                f"from process-global state, so it is not reproducible at a "
+                f"fixed seed. Use a named generator, e.g. "
+                f"`neg_rng = np.random.default_rng(seed + 1000)`: "
+                f"`{raw.strip()}`")
+            continue
+        m = _RNG_DRAW.search(code)
+        if m and not _EPOCH_PERMUTATION.search(code):
+            reasons.append(
+                f"draws `rng.{m.group(1)}` from run_fm's epoch-permutation "
+                f"generator, which shifts that stream and breaks the "
+                f"candidate-vs-parent common-random-numbers pairing the paired "
+                f"bootstrap needs. Use a separate generator, e.g. "
+                f"`neg_rng = np.random.default_rng(seed + 1000)`: "
+                f"`{raw.strip()}`")
+    return reasons
+
+
+# --------------------------------------------------------------------------- #
 #  Public entry point                                                          #
 # --------------------------------------------------------------------------- #
 def pre_execution_gate(code_diff: str) -> dict:
@@ -191,6 +276,7 @@ def pre_execution_gate(code_diff: str) -> dict:
     reasons += _check_non_causal(added)
     reasons += _check_external(added)
     reasons += _check_auxiliary(added)
+    reasons += _check_rng_isolation(added, _removed_lines(code_diff))
 
     # de-duplicate while preserving order
     seen, uniq = set(), []

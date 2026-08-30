@@ -54,7 +54,17 @@ RUNTIME — code that violates this is killed before it scores:
   sandbox kills a candidate at 240s. Vectorise with numpy — a per-row Python
   loop over the 1.14M training rows will not finish.
 - Determinism matters: the search compares candidates at ~0.001, so seed
-  anything stochastic from the --seed argument."""
+  anything stochastic from the --seed argument.
+- ANY new randomness (negative sampling, dropout masks, row subsampling,
+  tie-breaking) needs its OWN generator:
+      neg_rng = np.random.default_rng(seed + 1000)
+  NEVER draw from the existing `rng` that run_fm uses for its
+  epoch permutation, and NEVER call np.random.* directly. The search scores this
+  candidate by pairing its per-user results against its parent's at the same
+  seed, which only cancels noise while both runs consume the same draws in the
+  code they share; one extra draw from `rng` shifts every later epoch shuffle
+  and the inflated variance reads as a real effect. The static gate rejects
+  either form."""
 
 WRITER_SYSTEM_MODEL = f"""\
 You are a precise ML systems engineer editing baseline.py, which holds TWO
