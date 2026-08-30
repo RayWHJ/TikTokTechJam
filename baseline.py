@@ -4,12 +4,61 @@
   --model random: 随机打分（下界，用来自检评测代码没坏）
 只依赖 numpy。用法见 README.md
 """
-import argparse, collections, time
+import argparse, collections, json, os, time
 import numpy as np
 from data import load, encode, FIELDS
 from evaluate import evaluate
 
 def sigmoid(x): return 1.0 / (1.0 + np.exp(-np.clip(x, -30, 30)))
+
+# ---------------- orchestrator contract (codegen/sandbox.py) ----------------
+# The sandbox invokes a candidate as `python <candidate> --data_dir D --seed S`
+# with CODEGEN_SPLIT naming the split to score, and prefers to read back a
+# `##CODEGEN_METRICS## {json}` line. Emitting that marker is what makes the
+# split argument real: without it the sandbox falls back to regex-scraping
+# "primary ..." lines and keeps the LAST one, which is the test line printed
+# below — so the search was being steered by test scores.
+METRICS_MARK = '##CODEGEN_METRICS##'
+
+# Mirrors harness/_sizes.py SPLIT_RANGES: these two partition data.py's 'valid'.
+# Duplicated because the sandbox deliberately does not expose the harness package
+# to candidates; tests/test_split_ranges_agree.py asserts they stay identical.
+VALID_SUBSPLITS = {'valid_search':  (20220422, 20220426),
+                   'valid_confirm': (20220427, 20220428)}
+
+
+def cut_valid_subsplits(splits):
+    """Add valid_search / valid_confirm, re-cut from 'valid' by date."""
+    out = dict(splits)
+    for name, (lo, hi) in VALID_SUBSPLITS.items():
+        out[name] = [x for x in splits['valid'] if lo <= x[0] <= hi]
+    return out
+
+
+def per_user_primary(user_ids, labels, scores):
+    """Per-user primary, computed through the frozen evaluate() so the per-user
+    metric definition is identical to the aggregate one.
+
+    Restricted to the users GAUC itself counts (0 < positives < impressions): a
+    user whose labels are all 0 or all 1 has no rankable signal, so including
+    them would only pad the paired candidate-vs-parent bootstrap with constant
+    zero deltas and wash out p_positive.
+
+    Note this is a per-user analogue, not a decomposition — aggregate GAUC is
+    positive-weighted across users, so mean(per_user) != aggregate primary.
+    """
+    byu = collections.defaultdict(list)
+    for u, y, s in zip(user_ids, labels, scores):
+        byu[u].append((y, s))
+    out = {}
+    for u, rows in byu.items():
+        labs = [int(y) for y, _ in rows]
+        npos = sum(labs)
+        if not 0 < npos < len(labs):
+            continue
+        r = evaluate([u] * len(rows), labs, [float(s) for _, s in rows])
+        out[u] = round(float(r['primary']), 6)
+    return out
 
 # ---------------- item popularity（官方 baseline） ----------------
 def run_pop(splits, prior=20.0):
@@ -72,18 +121,25 @@ class FM:
     def predict(self, X, bs=200_000):
         return np.concatenate([self.logits(X[i:i + bs])[0] for i in range(0, len(X), bs)])
 
-def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbose=True):
+def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbose=True,
+           select_on='valid', report_on=('valid', 'test'), return_preds=False):
+    """Train an FM, early-stopping on `select_on`, and score every `report_on` split.
+
+    The defaults reproduce the original valid/test behaviour exactly. The
+    orchestrator passes select_on='valid_search' so that model selection never
+    touches valid_confirm, which stays a clean held-out check for promotion.
+    """
     enc, dim = encode(splits)
-    Xtr, ytr, _ = enc['train']; Xva, yva, uva = enc['valid']; Xte, yte, ute = enc['test']
+    Xtr, ytr, _ = enc['train']; Xsel, ysel, usel = enc[select_on]
     m = FM(dim, k=k, lr=lr, seed=seed)
     rng = np.random.default_rng(seed)
     best, best_state, bad = -1, None, 0
     for ep in range(1, epochs + 1):
         idx = rng.permutation(len(ytr)); t0 = time.time()
         losses = [m.step(Xtr[idx[i:i + bs]], ytr[idx[i:i + bs]]) for i in range(0, len(idx), bs)]
-        va = evaluate(uva, yva, m.predict(Xva))
+        va = evaluate(usel, ysel, m.predict(Xsel))
         if verbose:
-            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | valid GAUC {va['GAUC']:.4f} "
+            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | {select_on} GAUC {va['GAUC']:.4f} "
                   f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
         if va['primary'] > best + 1e-5:
             best, bad = va['primary'], 0
@@ -94,8 +150,40 @@ def run_fm(splits, k=16, lr=0.001, epochs=40, bs=8192, patience=4, seed=0, verbo
                 if verbose: print(f"  early stop at epoch {ep}")
                 break
     m.V, m.W, m.b = best_state
-    return {'valid': evaluate(uva, yva, m.predict(Xva)),
-            'test':  evaluate(ute, yte, m.predict(Xte))}
+    out, preds = {}, {}
+    for name in report_on:
+        X, y, u = enc[name]
+        s = m.predict(X)
+        out[name] = evaluate(u, y, s)
+        preds[name] = (u, y, s)
+    return (out, preds) if return_preds else out
+
+def run_for_orchestrator(a, split):
+    """Score exactly one split and emit the machine-readable metrics marker."""
+    if split == 'test':
+        raise SystemExit("CODEGEN_SPLIT=test refused: candidates never score the "
+                         "sealed test split.")
+    if a.model != 'fm':
+        raise SystemExit(f"CODEGEN_SPLIT set but --model={a.model}; orchestrator "
+                         "mode supports fm only.")
+    splits = cut_valid_subsplits(load(a.data_dir))
+    if split not in splits:
+        raise SystemExit(f"unknown CODEGEN_SPLIT {split!r}; expected one of "
+                         f"{sorted(VALID_SUBSPLITS)}")
+    # Always select on valid_search, so scoring valid_confirm stays uncontaminated.
+    res, preds = run_fm(splits, k=a.k, lr=a.lr, epochs=a.epochs, seed=a.seed,
+                        select_on='valid_search', report_on=(split,),
+                        return_preds=True)
+    users, labels, scores = preds[split]
+    # evaluate() is fed numpy predictions here, so its aggregates come back as
+    # np.float32 — not JSON-serializable. Coerce to plain Python numbers.
+    payload = {k: (int(v) if isinstance(v, (int, np.integer)) else float(v))
+               for k, v in res[split].items()}
+    payload['split'] = split
+    payload['seed'] = a.seed
+    payload['per_user'] = per_user_primary(users, labels, scores)
+    print(f"{METRICS_MARK} {json.dumps(payload)}")
+
 
 if __name__ == '__main__':
     ap = argparse.ArgumentParser()
@@ -107,6 +195,10 @@ if __name__ == '__main__':
     ap.add_argument('--epochs', type=int, default=40)
     ap.add_argument('--seed', type=int, default=0)
     a = ap.parse_args()
+    _split = os.environ.get('CODEGEN_SPLIT')
+    if _split:
+        run_for_orchestrator(a, _split)
+        raise SystemExit(0)
     print(f"loading {a.data_dir} ...")
     splits = load(a.data_dir)
     print({k_: len(v) for k_, v in splits.items()}, f"fields={FIELDS}")
