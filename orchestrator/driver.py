@@ -778,8 +778,21 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
     for it in range(1, max_iters + 1):
         elapsed = time.time() - t_start
         if verbose:
-            print(f"[iter {it}] open_nodes={len(open_nodes)} "
-                  f"global_best={global_best:.4f} elapsed={elapsed:.0f}s")
+            # Leading blank line, so each iteration is one visually separate
+            # block in run.log. Placed here rather than at the end of the
+            # iteration because the loop has several break/continue exits — one
+            # leading newline gives exactly one blank line between consecutive
+            # iterations without needing every exit path to remember to print it.
+            #
+            # current_best is the running best on valid_search (iter_history[-1]),
+            # NOT global_best: global_best only moves on a confirmed promotion, so
+            # printing it here would show a constant equal to `baseline` for any
+            # run that never promotes, which is every run so far. The two are
+            # reported separately in the final summary.
+            print(f"\n[iter {it}] open_nodes={len(open_nodes)} "
+                  f"current_best={iter_history[-1]:.4f} "
+                  f"baseline={root.local_best_score:.4f} "
+                  f"elapsed={elapsed:.0f}s")
 
         if elapsed > wallclock_cap_s:
             if verbose:
@@ -1174,10 +1187,79 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             break
 
     counters.wallclock_s = time.time() - t_start
+
+    # The best a candidate ever reached on valid_search, promoted or not. Kept
+    # separate from global_best because they answer different questions: "did the
+    # search find anything" versus "did anything survive the sealed confirm
+    # split". A run where those two differ is a run whose gains did not replicate,
+    # which is the single most important thing a reader needs to see.
+    scored_iters = [r for r in iter_records if r["iter_primary"] is not None]
+    best_iter = max(scored_iters, key=lambda r: r["iter_primary"], default=None)
+
     return {"global_best": global_best,
             "global_best_node_id": global_best_node.id,
+            "baseline_primary": root.local_best_score,
+            "best_valid_search": best_iter["iter_primary"] if best_iter else None,
+            "best_valid_search_node_id": (best_iter["iter_primary_node"]
+                                          if best_iter else None),
+            "iters_completed": len(iter_records),
             "history": history,
             "counters": counters}
+
+
+def print_final_summary(result: dict) -> None:
+    """The end-of-run block: best score, whether it is still the baseline, the
+    baseline itself, then the counters.
+
+    The baseline flag is the point of this function. `global_best` only advances
+    on a promotion confirmed against the sealed valid_confirm split, so a run
+    that found nothing prints a "best" numerically identical to the baseline —
+    and read quickly, 0.5946 looks like a result rather than the absence of one.
+    Saying so outright is the difference between a log that reports progress and
+    a log that reports the truth.
+    """
+    best = result["global_best"]
+    baseline = result.get("baseline_primary")
+    print("\n=== final ===")
+
+    is_baseline = baseline is not None and abs(best - baseline) < NOOP_EPSILON
+    node = result.get("global_best_node_id")
+    if is_baseline:
+        print(f"best primary:     {best:.6f}   "
+              f"** STILL THE BASELINE — nothing was promoted **")
+    elif baseline is None:
+        # The root measurement failed, so there is no baseline to compare to and
+        # claiming a delta against the published fallback would be misleading.
+        print(f"best primary:     {best:.6f}   (node {node}; "
+              f"baseline UNMEASURED)")
+    else:
+        print(f"best primary:     {best:.6f}   "
+              f"({best - baseline:+.6f} vs baseline, node {node})")
+    if baseline is not None:
+        print(f"baseline primary: {baseline:.6f}")
+
+    # Only worth a line when it disagrees with global_best: that gap is exactly
+    # "a candidate beat the baseline on valid_search and then failed to
+    # replicate on the sealed split", which the two numbers above cannot show.
+    seen = result.get("best_valid_search")
+    if seen is not None and baseline is not None and seen > best + NOOP_EPSILON:
+        print(f"best seen on valid_search (UNCONFIRMED): {seen:.6f} "
+              f"({seen - baseline:+.6f} vs baseline, "
+              f"node {result.get('best_valid_search_node_id')}) — "
+              f"did not survive promotion")
+
+    promotions = max(len(result.get("history") or []) - 1, 0)
+    print(f"iterations: {result.get('iters_completed', '?')} | "
+          f"promotions: {promotions}")
+
+    c = result["counters"]
+    print("counters:")
+    for field, value in asdict(c).items():
+        if isinstance(value, dict):
+            value = "  ".join(f"{k}={v}" for k, v in value.items())
+        elif isinstance(value, float):
+            value = f"{value:.1f}"
+        print(f"  {field:18s} {value}")
 
 
 if __name__ == "__main__":
@@ -1222,7 +1304,4 @@ if __name__ == "__main__":
         print(f"[mock] state dir: {mock_state}")
 
     result = run(max_iters=args.max_iters, **run_kwargs)
-    print("\n=== final ===")
-    print("best:", result["global_best"])
-    print("history:", result["history"])
-    print("counters:", result["counters"])
+    print_final_summary(result)
