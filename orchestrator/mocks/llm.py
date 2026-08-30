@@ -34,8 +34,14 @@ def ground_in_literature(bottleneck):
             "implementation_cost": "small",
             "primary_citation": "Rendle et al. 2009 BPR"}
 
-def generate_hypothesis(diagnosis, evidence_card):
+def generate_hypothesis(diagnosis, evidence_card, tried=None):
     """One hypothesis, varying with the diagnosis it was given.
+
+    `tried` is accepted and folded into the variant tag rather than ignored.
+    Ignoring it would let the mock diverge from the real signature, and it is
+    also the only way a mocked run can exercise the ledger path at all: the
+    driver now passes an attempt ledger on every improve iteration, so a mock
+    that dropped it would silently mask a TypeError in production.
 
     The variation is load-bearing, not cosmetic. This used to return a single
     frozen mechanism, so every iteration produced the same _fingerprint, and
@@ -51,6 +57,7 @@ def generate_hypothesis(diagnosis, evidence_card):
     """
     tag = hashlib.sha1(
         f"{diagnosis.get('bottleneck', '')}|{diagnosis.get('evidence', '')}"
+        f"|{len(tried or [])}"
         .encode("utf-8")).hexdigest()[:8]
     return [{
         "mechanism": ("swap pointwise logloss for BPR pairs sampled within "

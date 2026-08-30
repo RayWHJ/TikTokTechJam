@@ -36,7 +36,14 @@ from .node import Node
 from .memory import Memory, EvidenceEntry
 from .selection import select
 from .triage import rank
-from .promotion import bootstrap_delta, should_continue_locally, should_promote_globally
+# should_continue_locally is deliberately NOT imported any more. It still lives
+# in promotion.py and is still the right rule for a significance claim, but the
+# driver's only two decisions are parent acceptance (a hill-climb step, hence
+# should_expand_as_parent) and promotion (checked inline against
+# PROMOTE_TRIGGER_P_POS). Leaving the import in place would suggest a third
+# call site that no longer exists.
+from .promotion import (bootstrap_delta, should_expand_as_parent,
+                        should_promote_globally)
 from .convergence import local_plateau, global_should_stop
 from .counters import Counters
 from . import ablation_harness
@@ -78,6 +85,26 @@ CONFIRM_SEEDS = (0,)
 # delta this search has ever produced (+0.0011), so no candidate was ever
 # eligible for a confirm run at all.
 PROMOTE_TRIGGER_P_POS = 0.9
+
+# Parent acceptance (see promotion.should_expand_as_parent). Separate from the
+# promotion gate above on purpose: promotion is a claim tested on a sealed
+# split, parent acceptance is one step of a hill climb. The old code used the
+# significance test for both, so a +0.00059 candidate that missed p_pos=0.8 by
+# 0.024 was discarded as a parent and the tree never left the root.
+HILLCLIMB_MIN_MEAN_DELTA = 0.0
+HILLCLIMB_MIN_P_POSITIVE = 0.5
+
+# Cap on the frontier. Unbounded open_nodes makes select()'s UCT term diffuse
+# over branches that already lost; keeping the best few by scalar primary
+# concentrates the remaining iterations on the live ones.
+MAX_OPEN_NODES = 4
+
+# Where the best-scoring candidate's source is archived. The staged candidate
+# dirs live under tempfile.gettempdir() and are not durable — on the run that
+# produced orchestrator/_state/ they were /var/folders/... which macOS clears.
+# Nothing copied the winner out, so even a candidate that beat the baseline
+# left no artifact to generate a submission from.
+CHAMPION_DIR = os.path.join("orchestrator", "_state", "champions")
 
 # Two candidate per-user vectors closer than this are the same computation.
 # A rewrite that applies cleanly but leaves the executed code path untouched
@@ -309,6 +336,41 @@ def _measure_confirm_baseline(counters: Counters, *, seeds=CONFIRM_SEEDS,
     return {int(s): v.get("per_user", {}) for s, v in measured.items()}
 
 
+#: Mechanism families for fingerprinting, checked in order — first match wins,
+#: so put the specific surrogates ahead of the generic "pairwise/listwise"
+#: bucket they belong to. Deliberately coarse: the point is that two proposals
+#: which would produce substantially the same edit collapse to one entry, not
+#: that the taxonomy is complete. Unmatched mechanisms fall through to a prose
+#: hash, which is the old behaviour and stays permissive for genuinely novel
+#: ideas.
+_MECHANISM_FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("lambdarank_surrogate", ("lambdarank", "lambda rank", "lambda-weight",
+                              "lambda weight")),
+    ("ranknet_pairwise", ("ranknet", "rank net")),
+    ("bpr_pairwise", ("bpr", "bayesian personalized ranking",
+                      "bayesian personalised ranking")),
+    ("listwise_softmax", ("listwise", "list-wise", "within-user softmax",
+                          "softmax over these scores", "softmax loss")),
+    ("generic_pairwise", ("pairwise loss", "pairwise ranking", "pair-wise")),
+    ("multitask_auxiliary", ("multi-task", "multitask", "auxiliary task",
+                             "auxiliary loss", "esmm")),
+    ("sequence_features", ("sequence", "behaviour history", "behavior history",
+                           "user history", "din", "target attention")),
+    ("watchtime_censored", ("censored", "watch time", "watch-time",
+                            "play_time")),
+    ("capacity_or_regularization", ("embedding dimension", "embedding dim",
+                                    "increase k", "weight decay", "dropout",
+                                    "l2 regularization", "l2 regularisation")),
+    ("static_feature_domains", ("add feature", "additional feature",
+                               "more feature", "feature domain",
+                               "extra categorical")),
+    ("negative_sampling", ("negative sampling", "sample negatives",
+                           "hard negative")),
+    ("gbdt_swap", ("lightgbm", "gbdt", "gradient boost")),
+    ("ensemble_blend", ("ensemble", "blend", "stack")),
+)
+
+
 def _fingerprint(h: dict):
     """Semantic fingerprint of a hypothesis.
 
@@ -323,7 +385,20 @@ def _fingerprint(h: dict):
                 h.get("sampler", "uniform"),
                 h.get("feature_set", "5field_baseline"),
                 h.get("dataset_tier", "pure"))
+    # No structured fields: classify the mechanism into a FAMILY rather than
+    # hashing its prose. Hashing prose made dedup dead code — every proposal in
+    # the 5-iteration run was a loss swap, but each was worded differently, so
+    # each hashed differently and memory.is_duplicate (an exact tuple match)
+    # never fired once across 11 candidates. Matching on family means the
+    # second "replace pointwise logloss with BPR" is recognised as the first
+    # one no matter how it is phrased.
     mech = (h.get("mechanism") or "").strip().lower()
+    sketch = (h.get("implementation_sketch") or "").strip().lower()
+    text = f"{mech} {sketch}"
+    family = next((fam for fam, tokens in _MECHANISM_FAMILIES
+                   if any(t in text for t in tokens)), None)
+    if family is not None:
+        return ("mechanism_family", family, "", "")
     digest = hashlib.sha1(mech.encode("utf-8")).hexdigest()[:16]
     return ("mechanism_hash", digest, "", "")
 
@@ -431,6 +506,89 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
             }, default=str) + "\n")
 
 
+def _archive_champion(node: Node, primary: float, *,
+                      champion_dir: str | None = None) -> str | None:
+    """Copy the best-scoring candidate's staged source somewhere durable.
+
+    Candidate dirs come from _apply_diff_and_stage, which stages under
+    tempfile.gettempdir(). On the machine that produced orchestrator/_state/
+    that was /var/folders/hr/..., which macOS clears — and nothing ever copied
+    the winner out. So a run whose best candidate beat the baseline still left
+    no source tree to regenerate a submission from once the temp dir went away.
+
+    Writes <champion_dir>/<node id>/ containing the staged modules plus a
+    manifest naming the score and the hypothesis, so the archive is
+    self-describing without needing progress.json alongside it. Returns the
+    directory, or None if the node has nothing to archive.
+    """
+    champion_dir = champion_dir or CHAMPION_DIR
+    if not node.code_dir or not os.path.isdir(node.code_dir):
+        return None
+    dest = os.path.join(champion_dir, node.id)
+    os.makedirs(dest, exist_ok=True)
+    for name in _STAGED_MODULES:
+        src = os.path.join(node.code_dir, name)
+        if os.path.exists(src):
+            shutil.copy2(src, os.path.join(dest, name))
+    _write_json_atomic(os.path.join(dest, "manifest.json"), {
+        "id": node.id,
+        "parent_id": node.parent_id,
+        "operation": node.operation,
+        "primary": primary,
+        "per_seed_primary": node.per_seed_primary,
+        "mean_delta": node.mean_delta,
+        "p_positive": node.p_positive,
+        "lower_95": node.lower_95,
+        "confirm_primary": node.confirm_primary,
+        "hypothesis": node.hypothesis,
+        "diagnosis": node.diagnosis,
+        "staged_from": node.code_dir,
+        "archived_at": time.time(),
+    })
+    return dest
+
+
+#: How many past attempts to show a proposal operator. Bounded because the
+#: ledger is rendered into every diagnose/hypothesis prompt and an unbounded
+#: history is exactly the context blowup ML-Master's scoped memory avoids.
+LEDGER_MAX_ENTRIES = 12
+
+
+def _attempt_ledger(nodes: List[Node], parent: Node,
+                    max_entries: int = LEDGER_MAX_ENTRIES) -> List[dict]:
+    """What has already been tried, for the proposal operators to read.
+
+    THE missing input. diagnose() used to receive only
+    {parent, history, iter_history, improvement_score, ablations} and
+    generate_hypothesis() only (diagnosis, evidence_card) — neither could see
+    a single prior attempt. With the parent frozen at the root the diagnosis
+    was therefore identical every iteration ("objective mismatch: pointwise
+    loss on a ranking metric"), and all 11 proposals across the 5-iteration
+    run were BPR / listwise-softmax / RankNet / LambdaRank reworded. The
+    memory store recorded every one of them and no prompt ever read it.
+
+    Scoping follows the two findings this is taken from: siblings of the node
+    about to be expanded, for diversity (AIRA), and every attempt's measured
+    outcome as feedback, for the inner refinement loop (MLE-STAR). Newest
+    last, so the most recent attempts sit closest to the instruction.
+    """
+    out: List[dict] = []
+    for n in nodes:
+        if n.hypothesis is None:
+            continue          # the root draft has no proposal to report
+        out.append({
+            "id": n.id,
+            "sibling_of_selected_parent": n.parent_id == parent.id,
+            "component": (n.diagnosis or {}).get("component"),
+            "mechanism": (n.hypothesis or {}).get("mechanism"),
+            "outcome": n.evidence_type or ("scored" if n.per_seed_primary
+                                           else "unresolved"),
+            "primary": _scalar_primary(n) if n.per_seed_primary else None,
+            "mean_delta_vs_parent": n.mean_delta,
+        })
+    return out[-max_entries:]
+
+
 def _prior_refines_for_component(component: str,
                                  path: str | None = None) -> List[dict]:
     """Scan nodes.jsonl for prior refine attempts on this component.
@@ -486,6 +644,7 @@ def _build_improve_candidates(parent: Node, *,
                               history: List[float],
                               iter_history: List[float],
                               improvement_score: float | None,
+                              tried: List[dict] | None = None,
                               verbose: bool = True
                               ) -> tuple[dict, List[Node]]:
     """The pre-Phase-2 improve path, factored out and enriched with
@@ -508,17 +667,22 @@ def _build_improve_candidates(parent: Node, *,
         cached_ablations = {k: v for k, v in cached_ablations.items()
                             if v is not None}
 
+    tried = tried or []
     diag = diag_llm.diagnose({
         "parent": parent.id,
         "history": history,                     # promotion ladder (unchanged)
         "iter_history": list(iter_history),     # iteration-level trajectory
         "improvement_score": improvement_score, # current ε/N plateau signal
         "ablations": cached_ablations or None,
+        # Every prior attempt and what it measured. Without this the
+        # diagnostician re-derived the same bottleneck from the same trajectory
+        # every iteration; see _attempt_ledger.
+        "tried": tried or None,
     })
     counters.bump("tokens", 500)
     evidence_card = diag_llm.ground_in_literature(diag["bottleneck"])
     counters.bump("tokens", 500)
-    hypotheses = diag_llm.generate_hypothesis(diag, evidence_card)
+    hypotheses = diag_llm.generate_hypothesis(diag, evidence_card, tried=tried)
     counters.bump("proposals", len(hypotheses))
     counters.bump("tokens", 300 * len(hypotheses))
 
@@ -613,7 +777,21 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         progress_path: str | None = PROGRESS_PATH,
         root_baseline_path: str | None = ROOT_BASELINE_PATH,
         confirm_baseline_path: str | None = CONFIRM_BASELINE_PATH,
-        memory_path: str | None = None):
+        memory_path: str | None = None,
+        champion_dir: str | None = None):
+    """`champion_dir` is a parameter rather than only the CHAMPION_DIR global
+    for the same isolation reason progress_path and memory_path are: a mocked
+    or tested run must not archive its candidates into the live
+    orchestrator/_state/champions/. It defaults to the global at call time, so
+    a real run needs to pass nothing.
+
+    That default mattered immediately: the first mocked 8-iteration run and the
+    driver-level tests together left 27 mock champions in the live directory,
+    every one scored ~0.60 on the mocks' 10-user synthetic split. Since that
+    directory is what a submission gets generated from, a real winner would
+    have been indistinguishable from a mock artifact.
+    """
+    champion_archive_dir = champion_dir or CHAMPION_DIR
     memory = Memory(path=memory_path) if memory_path else Memory()
     counters = Counters()
     t_start = time.time()
@@ -637,9 +815,23 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
               f"measured={root_measured}")
 
     open_nodes: List[Node] = [root]
+    # Every node ever created, in creation order. open_nodes is the frontier and
+    # gets pruned; this is the full record the attempt ledger reads from, so a
+    # branch that was abandoned still warns the proposal operators off it.
+    all_nodes: List[Node] = [root]
     global_best = root.local_best_score
     global_best_node = root
     history: List[float] = [root.local_best_score]
+
+    # The best candidate by scalar primary, regardless of whether it ever
+    # cleared the sealed-split promotion gate. THE run this repo's state was
+    # captured from promoted nothing, so global_best_node stayed the root and
+    # the deliverable was the unmodified baseline — a 5-iteration search whose
+    # output was its own starting point. A greedy champion is what makes the
+    # run produce something; promotion stays the stronger, separate claim.
+    champion = root
+    champion_primary = root.local_best_score
+    champion_archive: str | None = None
 
     # The root is line 0 of the log: the draft seed every later node descends
     # from, emitted before any iteration so the tree reads top-down.
@@ -913,11 +1105,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 counters=counters, history=history,
                 iter_history=iter_history,
                 improvement_score=recent_improvement,
+                tried=_attempt_ledger(all_nodes, parent),
                 verbose=verbose,
             )
             improves_since_refine += 1
 
         parent.n_visits += 1
+        all_nodes.extend(candidates)
 
         if not candidates:
             parent.status = "closed"
@@ -1110,9 +1304,32 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 c.per_user_by_seed, parent.per_user_by_seed)
             c.mean_delta, c.p_positive, c.lower_95 = mean_d, p_pos, lower_95
 
-            if should_continue_locally(mean_d, p_pos, lower_95):
+            # Parent acceptance is a HILL-CLIMB step, not a significance test.
+            # should_continue_locally (p_pos > 0.8 and lower_95 > 0) is kept in
+            # the module and still gates the sealed-split promotion below, but
+            # using it here is what froze the tree: iteration 1's +0.00059
+            # winner came back p_pos=0.776 / lower_95=-0.00067, was refused as a
+            # parent, and every later iteration re-expanded the pristine root.
+            if should_expand_as_parent(mean_d, p_pos, lower_95,
+                                       min_mean_delta=HILLCLIMB_MIN_MEAN_DELTA,
+                                       min_p_positive=HILLCLIMB_MIN_P_POSITIVE):
                 if c not in open_nodes:
                     open_nodes.append(c)
+                    if verbose:
+                        print(f"  {c.id} accepted as parent "
+                              f"(paired delta {mean_d:+.5f}, p_pos {p_pos:.3f})")
+
+            # Greedy champion, independent of promotion. Archived immediately —
+            # the staged dir is temporary and the run that produced
+            # orchestrator/_state/ lost every candidate tree it built.
+            if c.local_best_score > champion_primary:
+                champion, champion_primary = c, c.local_best_score
+                champion_archive = _archive_champion(
+                    c, champion_primary, champion_dir=champion_archive_dir)
+                if verbose:
+                    print(f"[champion] {c.id} primary={champion_primary:.4f} "
+                          f"({champion_primary - root.local_best_score:+.4f} vs "
+                          f"baseline) archived to {champion_archive}")
 
             # 5. Promotion — sealed valid_confirm scorer, only when trigger clears.
             #
@@ -1172,6 +1389,23 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 evidence_type=c.evidence_type or "inconclusive",
                 note=c.hypothesis.get("mechanism", "")))
 
+        # Prune the frontier to the best MAX_OPEN_NODES by scalar primary. The
+        # root is never dropped, so the search can always fall back to a fresh
+        # draft if every branch dies. Without a cap, select()'s UCT term spreads
+        # visits over branches that already lost — the exploration bonus is
+        # sqrt(log(total)/n_visits), so an untried loser outranks a proven
+        # parent indefinitely.
+        if len(open_nodes) > MAX_OPEN_NODES:
+            keep = sorted(open_nodes, key=_scalar_primary,
+                          reverse=True)[:MAX_OPEN_NODES]
+            if root not in keep:
+                keep[-1] = root
+            for n in open_nodes:
+                if n not in keep and n.status == "open":
+                    n.status = "closed"
+                    n.evidence_type = n.evidence_type or "inconclusive"
+            open_nodes = keep
+
         _record_iteration(it, candidates, promoted_ids, global_best_at_start)
 
         # iter_history, not history: `history` only grows on promotion, so it
@@ -1187,6 +1421,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             break
 
     counters.wallclock_s = time.time() - t_start
+    if verbose:
+        print(f"\n[champion] {champion.id} primary={champion_primary:.4f} "
+              f"({champion_primary - root.local_best_score:+.4f} vs baseline)"
+              f"{'' if champion is not root else ' — the unmodified baseline'}")
+        if champion_archive:
+            print(f"[champion] source archived at {champion_archive}")
 
     # The best a candidate ever reached on valid_search, promoted or not. Kept
     # separate from global_best because they answer different questions: "did the
@@ -1198,6 +1438,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
 
     return {"global_best": global_best,
             "global_best_node_id": global_best_node.id,
+            # The greedy best, which is what a submission should be generated
+            # from when nothing cleared the sealed-split promotion gate.
+            "champion_primary": champion_primary,
+            "champion_node_id": champion.id,
+            "champion_dir": champion_archive,
+            "champion_is_baseline": champion is root,
             "baseline_primary": root.local_best_score,
             "best_valid_search": best_iter["iter_primary"] if best_iter else None,
             "best_valid_search_node_id": (best_iter["iter_primary_node"]
@@ -1300,6 +1546,12 @@ if __name__ == "__main__":
             "confirm_baseline_path": os.path.join(mock_state,
                                                   "confirm_baseline.json"),
             "memory_path": os.path.join(mock_state, "memory.json"),
+            # Isolated for the same reason as the paths above. Without it a
+            # mocked run archives its fake champions into the live
+            # orchestrator/_state/champions/ — which is the directory a
+            # submission gets generated from, so a real winner would sit there
+            # indistinguishable from mock source scored on 10 synthetic users.
+            "champion_dir": os.path.join(mock_state, "champions"),
         }
         print(f"[mock] state dir: {mock_state}")
 

@@ -102,6 +102,15 @@ Two trajectory fields may also be present:
   bottlenecks whose fix would move the currently under-utilised
   components rather than tune what already works.
 
+When a "tried" field is present, it lists every mechanism already attempted
+in this run with its outcome and its measured candidate-minus-parent delta.
+READ IT BEFORE COMMITTING TO A BOTTLENECK. If several attempts already
+targeted one component and none of them produced a positive delta, that
+component is evidence-against, not an open question — name a different
+bottleneck. Naming the same bottleneck a fourth time because the trajectory
+still looks flat is the single most expensive failure mode available to you:
+it costs an entire iteration and returns information you already had.
+
 When an "ablations" field is present, it maps component names to the
 (parent - parent_without_component) delta observed by controlled
 ablation. A small delta means the pipeline barely depends on that
@@ -189,11 +198,27 @@ made, including HOW you would tell if you were right.
 
 Critical constraint on "success_criterion_paired": phrase it as a
 candidate-minus-parent DELTA on a NAMED validation tier — e.g. "primary on
-val-tier-2 improves by at least +0.003 over the parent node's primary on the
+val-tier-2 improves by at least +0.001 over the parent node's primary on the
 same tier" — never as a flat absolute threshold like "GAUC reaches 0.60".
 Absolute thresholds don't account for tier-to-tier variance or for the
 parent node's own performance, and are not acceptable here under any
 framing.
+
+CALIBRATE THE DELTA TO WHAT IS ACHIEVABLE. The baseline's own 5-seed std is
+0.0008, and the largest candidate-minus-parent delta this search has ever
+measured is +0.0006. So a criterion of "+0.005" or "+0.007" is not ambitious,
+it is uncalibrated — and it does real damage, because it pushes the
+implementation toward ripping out and replacing a working training path when
+the change that actually survives is almost always additive. State a target
+in the +0.001 to +0.002 range and mean it.
+
+PREFER THE SMALLEST EDIT THAT TESTS THE MECHANISM. If the idea is a new loss,
+ADD it as a weighted term alongside the existing pointwise logloss with a
+small weight, rather than replacing the loss outright — a blend degrades to
+the parent as the weight goes to zero, so the worst case is no change instead
+of a large regression. Wholesale replacement of the model, the loss, or the
+training loop is a last resort, and if you propose it you must say why an
+additive version cannot test the same claim.
 
 You will be told how many hypotheses to produce (1, unless the diagnosis
 confidence is low or the situation suggests a plateau, in which case you

@@ -26,29 +26,52 @@ def _decide_count(diagnosis: dict) -> int:
     return 1
 
 
-def _build_prompt(diagnosis: dict, evidence_card: dict, count: int) -> str:
+def _build_prompt(diagnosis: dict, evidence_card: dict, count: int,
+                  tried: List[Dict] | None = None) -> str:
     plural = "hypothesis" if count == 1 else f"exactly {count} hypotheses"
+    tried_block = ""
+    if tried:
+        tried_block = (
+            "ALREADY ATTEMPTED in this run — each entry is a mechanism that was "
+            "proposed, the outcome of implementing it, and its measured "
+            "candidate-minus-parent delta where one exists. Do NOT re-propose "
+            "any mechanism in this list, however differently worded. Treat a "
+            "`failed_implementation` outcome as evidence about the WRITER's "
+            "budget, not about the idea: if you want that direction, propose a "
+            "cheaper implementation of it, and say what makes it cheaper. "
+            "Treat a negative `mean_delta_vs_parent` as evidence against the "
+            "idea itself.\n"
+            f"{json.dumps(tried, indent=2)}\n\n"
+        )
     return (
         "Diagnosis (JSON):\n"
         f"{json.dumps(diagnosis, indent=2)}\n\n"
         "Evidence card from literature grounding (JSON):\n"
         f"{json.dumps(evidence_card, indent=2)}\n\n"
+        f"{tried_block}"
         f"Produce {plural} as a JSON array, matching the required schema exactly. "
         f"The array must contain exactly {count} object(s)."
     )
 
 
-def generate_hypothesis(diagnosis: dict, evidence_card: dict) -> List[Dict]:
+def generate_hypothesis(diagnosis: dict, evidence_card: dict,
+                        tried: List[Dict] | None = None) -> List[Dict]:
     """Produce 1 hypothesis by default, or up to 3 if diagnosis confidence
     is low or the diagnosis text suggests a plateau. See
     personas.HYPOTHESIS_SYSTEM_PROMPT for the full persona/task description.
+
+    `tried` is the attempt ledger from orchestrator.driver._attempt_ledger:
+    prior mechanisms with their outcomes and measured deltas. It is optional so
+    existing callers keep working, but omitting it is what produced 11
+    consecutive restatements of "replace the pointwise loss with a pairwise
+    one" — the operator had no way to know it was repeating itself.
 
     Raises:
         LLMSchemaError: if the model can't produce a schema-valid array of
             exactly the requested length within the retry budget.
     """
     count = _decide_count(diagnosis)
-    prompt = _build_prompt(diagnosis, evidence_card, count)
+    prompt = _build_prompt(diagnosis, evidence_card, count, tried=tried)
 
     def call_fn(p: str) -> str:
         return call_model_text(HYPOTHESIS_SYSTEM_PROMPT, p, model=DEFAULT_MODEL)

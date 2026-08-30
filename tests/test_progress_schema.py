@@ -91,7 +91,7 @@ def _install(monkeypatch, tmp_path, script):
                 "edit_radius": "small", "expected_cost": "medium",
                 "incompatibilities": [], "uncertainty": 0.25}
 
-    def generate_hypothesis(diagnosis, evidence_card):
+    def generate_hypothesis(diagnosis, evidence_card, tried=None):
         # loss_type and mechanism both carry the iteration index: the former
         # keeps _fingerprint unique so memory dedup doesn't swallow iteration 2
         # onward, the latter keeps the written diff unique so the run-wide

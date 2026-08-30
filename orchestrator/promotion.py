@@ -49,6 +49,31 @@ def should_continue_locally(mean_delta, p_positive, lower_95, margin=0.0):
     """
     return p_positive > 0.8 and lower_95 > margin
 
+def should_expand_as_parent(mean_delta, p_positive, lower_95,
+                            min_mean_delta=0.0, min_p_positive=0.5):
+    """Should this candidate become a parent that later iterations build on?
+
+    A HILL-CLIMB rule, deliberately not the significance test above.
+
+    Why the significance test is the wrong tool here. Measured on this repo's
+    own cached root baseline: two runs of the SAME unmodified model at
+    different seeds produce per-user primary deltas with std 0.127. Pooling
+    ~10.9k users x 3 seeds, the 95% one-sided bound sits about 0.0012 away
+    from the mean. The largest paired delta any candidate in this search has
+    ever produced is +0.00059. So `lower_95 > 0` demands an effect roughly
+    twice the largest one available — it is not a strict gate, it is an
+    unreachable one, and it is why open_nodes never grew past the root across
+    a full 5-iteration run.
+
+    Hill-climbing does not need significance. It needs the expected step to
+    point uphill more often than downhill; the sealed valid_confirm split is
+    where a real claim gets tested. So accept a candidate as a parent when its
+    paired mean delta is positive and the bootstrap is at least a coin flip on
+    the sign, and let selection + pruning discard branches that stop paying.
+    """
+    return mean_delta > min_mean_delta and p_positive >= min_p_positive
+
+
 def should_promote_globally(confirm_mean_delta, confirm_lower_95, margin=0.0005):
     """Promote to global champion?
 
