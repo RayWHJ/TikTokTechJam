@@ -905,7 +905,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                              f" | best paired delta {rec['best_mean_delta']:+.4f}")
                 print(f"[iter {it}] iter_primary={rec['iter_primary']:.4f} "
                       f"({rec['curr_vs_baseline']:+.4f} vs baseline)"
-                      f"{rec['curr_vs_champion']:+.4f} vs champion)"
+                      f"({rec['curr_vs_champion']:+.4f} vs champion)"
                       f"{delta_str} | candidates: {scores_str}")
             else:
                 # Say why there's no score, else "n/a" is unreadable in run.log.
