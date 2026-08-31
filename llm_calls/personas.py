@@ -108,6 +108,14 @@ ablation. A small delta means the pipeline barely depends on that
 component; prefer it as the "component" in your response, since that
 is where refinement has the most headroom.
 
+When an "exhausted_families" field is present, it maps component names to
+{{"attempts": N, "promotions": M, "best_delta": float}}. A component with
+many attempts and zero promotions has been tried repeatedly without success.
+DO NOT diagnose an exhausted component as the bottleneck — choose a
+different component from the STILL UNEXPLORED list. If loss_function is
+exhausted, consider feature_engineering, auxiliary_targets, or sampling
+instead.
+
 Be honest about uncertainty. If the node history is short or noisy, say so
 via a lower confidence and a higher uncertainty rather than pretending to be
 sure.

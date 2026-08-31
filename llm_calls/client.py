@@ -57,6 +57,7 @@ def call_model_text(system: str, user: str, model: str = DEFAULT_MODEL,
         instructions=system,
         input=user,
         max_output_tokens=max_tokens,
+        metadata={"user": "hailmary", "run": "hackathon"},
     )
     return resp.output_text
 
@@ -78,5 +79,6 @@ def call_model_with_search(system: str, user: str, model: str = DEFAULT_MODEL,
         input=user,
         max_output_tokens=max_tokens,
         tools=[{"type": "web_search"}],
+        metadata={"user": "hailmary", "run": "hackathon"},
     )
     return resp.output_text

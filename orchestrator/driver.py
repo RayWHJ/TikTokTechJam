@@ -88,7 +88,7 @@ NOOP_EPSILON = 1e-9
 # still-broken state and fails again would otherwise loop forever; two attempts
 # is enough at hackathon scale, since the second retry rarely helps if the
 # first didn't.
-MAX_FIX_ATTEMPTS = 2
+MAX_FIX_ATTEMPTS = 5
 
 # Wall-clock cap for the 1-seed triage run. The unmodified baseline trains and
 # scores valid_search in 18s measured on this machine (early-stopping at epoch
@@ -99,7 +99,7 @@ MAX_FIX_ATTEMPTS = 2
 # hypothesis thrown away. 240s is 13x the baseline and still well under the
 # 600s full-seed cap, so a candidate that clears triage cannot then time out
 # on seeds 1 and 2.
-TRIAGE_WALLCLOCK_CAP_S = 240
+TRIAGE_WALLCLOCK_CAP_S = 420
 
 # Plateau stop calibration. Deliberately NOT convergence.local_plateau's own
 # defaults (ε=0.002, N=3), which are unreachable on this task.
@@ -178,6 +178,38 @@ DATA_DIR = os.environ.get("CODEGEN_DATA_DIR",
 # measurement fails. It is the TEST primary from the README, not valid_search.
 FALLBACK_ROOT_PRIMARY = 0.5946
 
+def _exhausted_families(path: str | None = None) -> dict:
+    """Scan nodes.jsonl for components with many attempts and zero promotions.
+ 
+    Returns {"component_name": {"attempts": N, "promotions": M, "best_delta": float}}
+    for each component that has been tried at least 5 times.
+    """
+    path = path or NODES_LOG_PATH
+    if not os.path.exists(path):
+        return {}
+    by_component: dict = {}
+    with open(path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                r = json.loads(line)
+                comp = (r.get("diagnosis") or {}).get("component")
+                if not comp:
+                    continue
+                if comp not in by_component:
+                    by_component[comp] = {"attempts": 0, "promotions": 0,
+                                          "best_delta": float("-inf")}
+                entry = by_component[comp]
+                entry["attempts"] += 1
+                if r.get("status") == "promoted":
+                    entry["promotions"] += 1
+                md = r.get("mean_delta")
+                if md is not None and md > entry["best_delta"]:
+                    entry["best_delta"] = md
+            except ValueError:
+                continue
+    # Only report components with enough attempts to be considered exhausted
+    return {k: v for k, v in by_component.items()
+            if v["attempts"] >= 5 and v["promotions"] == 0}
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:8]
@@ -508,13 +540,16 @@ def _build_improve_candidates(parent: Node, *,
         cached_ablations = {k: v for k, v in cached_ablations.items()
                             if v is not None}
 
+    exhausted = _exhausted_families()
     diag = diag_llm.diagnose({
         "parent": parent.id,
         "history": history,                     # promotion ladder (unchanged)
         "iter_history": list(iter_history),     # iteration-level trajectory
         "improvement_score": improvement_score, # current ε/N plateau signal
         "ablations": cached_ablations or None,
+        "exhausted_families": exhausted or None,
     })
+
     counters.bump("tokens", 500)
     evidence_card = diag_llm.ground_in_literature(diag["bottleneck"])
     counters.bump("tokens", 500)

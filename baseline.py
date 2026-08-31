@@ -83,6 +83,123 @@ def run_random(splits, seed=0):
                              rng.random(len(rws)))
     return out
 
+def group_by_user_offsets(user_ids):
+    """Pre-compute per-user row ranges for vectorised within-user operations.
+ 
+    Parameters
+    ----------
+    user_ids : array-like of shape (N,)
+        User identifier per row (strings or ints — anything sortable).
+ 
+    Returns
+    -------
+    order : int32 array (N,)
+        Indices that sort the rows by user_id.
+    group_starts : int32 array (G,)
+        Start index (into `order`) of each user group.
+    group_ends : int32 array (G,)
+        One-past-end index of each user group.
+    group_ids : int32 array (N,)
+        Per-row group number (into group_starts / group_ends), in sorted order.
+ 
+    Usage
+    -----
+    order, starts, ends, gids = group_by_user_offsets(user_ids_train)
+    # rows for group g: order[starts[g] : ends[g]]
+    # all negative rows for group g (assuming sorted_y = y[order]):
+    #   neg_mask = sorted_y[starts[g]:ends[g]] == 0
+    """
+    user_arr = np.asarray(user_ids)
+    order = np.argsort(user_arr, kind='stable').astype(np.int32)
+    sorted_u = user_arr[order]
+ 
+    mask = np.empty(len(order), dtype=bool)
+    mask[0] = True
+    mask[1:] = sorted_u[1:] != sorted_u[:-1]
+ 
+    group_starts = np.flatnonzero(mask).astype(np.int32)
+    group_ends = np.empty_like(group_starts)
+    group_ends[:-1] = group_starts[1:]
+    group_ends[-1] = len(order)
+ 
+    group_ids = np.cumsum(mask, dtype=np.int32) - 1
+ 
+    return order, group_starts, group_ends, group_ids
+ 
+ 
+def build_bpr_tables(ytr, order, group_starts, group_ends, group_ids):
+    """Pre-compute positive-row and per-user negative-range arrays for BPR.
+ 
+    Parameters
+    ----------
+    ytr : float32 array (N,)       — training labels (0 or 1)
+    order, group_starts, group_ends, group_ids — from group_by_user_offsets
+ 
+    Returns
+    -------
+    pos_rows : int32 array (P,)
+        Indices (into the ORIGINAL unsorted arrays) of positive rows whose
+        user has at least one negative.
+    pos_groups : int32 array (P,)
+        Group id for each positive row.
+    neg_starts : int32 array (P,)
+        For each positive row, the start offset into `order` of that user's
+        negative block.
+    neg_counts : int32 array (P,)
+        Number of negatives for that user.
+ 
+    Usage
+    -----
+    # sample one random negative per positive:
+    off = (rng.random(len(pos_rows)) * neg_counts).astype(np.int64)
+    neg_rows = order[neg_starts + off]
+    """
+    sorted_y = ytr[order]
+ 
+    # Per-group negative counts (negatives sort before positives within each
+    # group because lexsort on (y, user) puts y=0 first, but we don't require
+    # that — we count explicitly).
+    neg_per_group = np.add.reduceat(
+        (sorted_y == 0).astype(np.int32), group_starts)
+    pos_per_group = (group_ends - group_starts) - neg_per_group
+    eligible = (neg_per_group > 0) & (pos_per_group > 0)
+ 
+    # Build a negative-start array: within each group the negatives are the
+    # rows where sorted_y == 0. We need each group's negatives to be
+    # contiguous so we can sample by offset. Re-sort within each group so
+    # negatives come first.
+    # Actually, since order = argsort(user_ids, stable), labels within a group
+    # are in their original row order, not sorted by label. We need to
+    # rearrange so negatives are contiguous within each group.
+    new_order = np.empty_like(order)
+    neg_start_per_group = np.empty(len(group_starts), dtype=np.int32)
+    write = 0
+    for g in range(len(group_starts)):
+        s, e = group_starts[g], group_ends[g]
+        block = order[s:e]
+        block_y = sorted_y[s:e]
+        negs = block[block_y == 0]
+        poss = block[block_y == 1]
+        neg_start_per_group[g] = write
+        new_order[write:write + len(negs)] = negs
+        write += len(negs)
+        new_order[write:write + len(poss)] = poss
+        write += len(poss)
+ 
+    # Now rebuild with the reordered data
+    sorted_y_new = ytr[new_order]
+    positive_mask = (sorted_y_new == 1) & eligible[group_ids]
+ 
+    # But group_ids was based on the old order. We need to rebuild group_ids
+    # for the new order. Since we didn't change group boundaries, just the
+    # within-group order, group_ids stays the same.
+    pos_rows = new_order[positive_mask].astype(np.int32)
+    pos_grps = group_ids[positive_mask].astype(np.int32)
+ 
+    return (pos_rows, pos_grps,
+            neg_start_per_group[pos_grps],
+            neg_per_group[pos_grps])
+
 # ---------------- Factorization Machine ----------------
 class FM:
     def __init__(self, dim, k=16, lr=0.001, l2=1e-6, seed=0):
