@@ -19,7 +19,7 @@ from typing import List
 
 import harness
 from llm_calls import (diagnose, ground_in_literature, generate_hypothesis,
-                       refine, audit)
+                       refine, audit, verdict)
 import codegen
 from codegen.ablations import ABLATIONS
 
@@ -30,6 +30,7 @@ class _LLM:
     generate_hypothesis = staticmethod(generate_hypothesis)
     refine = staticmethod(refine)
     audit = staticmethod(audit)
+    verdict = staticmethod(verdict)
 llm = _LLM()
 
 from .node import Node
@@ -503,6 +504,16 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
                 "lower_95": c.lower_95,
                 "fix_attempts": c.fix_attempts,
                 "wallclock_used_s": round(c.wallclock_used_s, 2),
+                # Why it failed and how the criterion it declared was judged.
+                # Both were previously unrecoverable after the run: the failure
+                # reason lived only in the run log, and the verdict did not
+                # exist, so "refuted" and "never implemented" and "criterion
+                # uncalibrated by 8x" were one indistinguishable record.
+                "last_error_excerpt": c.last_error_excerpt,
+                "verdict": c.verdict,
+                "verdict_reason": c.verdict_reason,
+                "next_action": c.next_action,
+                "criterion_was_calibrated": c.criterion_was_calibrated,
             }, default=str) + "\n")
 
 
@@ -585,8 +596,114 @@ def _attempt_ledger(nodes: List[Node], parent: Node,
                                            else "unresolved"),
             "primary": _scalar_primary(n) if n.per_seed_primary else None,
             "mean_delta_vs_parent": n.mean_delta,
+            # The grader's read on the criterion this attempt declared, and what
+            # it recommends doing with the mechanism family. Without these the
+            # ledger says an attempt scored +0.0006 but not whether that counted
+            # as success against what it promised — and "+0.0006 missed a
+            # miscalibrated +0.005" invites a cheaper retry, while
+            # "abandon_mechanism" forbids the family outright.
+            "verdict": n.verdict,
+            "next_action": n.next_action,
         })
     return out[-max_entries:]
+
+
+#: Token cost charged per verdict call. One call per SCORED candidate only —
+#: the unscored ones never reach the survivors loop — so at 3 survivors an
+#: iteration this is a rounding error against the 800 the writer already spends.
+VERDICT_TOKENS = 400
+
+
+def _apply_verdict(c: Node, parent: Node, root: Node, verdict_llm,
+                   counters: Counters, *, verbose: bool = True) -> None:
+    """Grade one scored candidate against its own declared criterion and write
+    the result onto the node.
+
+    Swallows every exception on purpose. A grader is commentary on a
+    measurement, never the measurement itself, so a schema failure or a network
+    error must not lose a candidate that already cost three full training runs.
+    On failure the node keeps verdict=None and the search proceeds exactly as it
+    did before this step existed.
+    """
+    if not c.hypothesis:
+        return
+    try:
+        v = verdict_llm.verdict(
+            c.hypothesis,
+            {"mean_delta": c.mean_delta,
+             "p_positive": c.p_positive,
+             "lower_95": c.lower_95,
+             "per_seed_primary": dict(c.per_seed_primary),
+             "candidate_primary": _scalar_primary(c),
+             "parent_primary": _scalar_primary(parent),
+             "evidence_type": c.evidence_type,
+             "n_seeds": len(c.per_seed_primary)},
+            {"baseline_primary": root.local_best_score,
+             "parent_id": parent.id,
+             "component": (c.diagnosis or {}).get("component"),
+             "paired_noise_floor": 0.0012,
+             "baseline_seed_std": 0.0008})
+    except Exception as e:                      # noqa: BLE001 — see docstring
+        if verbose:
+            print(f"  {c.id} verdict unavailable ({type(e).__name__}: {e}); "
+                  f"continuing without one")
+        return
+    counters.bump("tokens", VERDICT_TOKENS)
+    c.verdict = v["verdict"]
+    c.verdict_reason = v["reason"]
+    c.next_action = v["next_action"]
+    c.criterion_was_calibrated = v["criterion_was_calibrated"]
+    if verbose:
+        print(f"  {c.id} verdict={c.verdict} "
+              f"(criterion {'calibrated' if c.criterion_was_calibrated else 'UNCALIBRATED'}"
+              f", next: {c.next_action}) — {c.verdict_reason}")
+
+
+#: How much of a failed ancestor's log tail to carry. ~600 chars is enough for a
+#: Python traceback's final frame plus its exception line, which is the part that
+#: says what to fix.
+ANCESTOR_ERROR_CHARS = 600
+
+#: How far up the tree the debug operator is shown. Bounded for the same reason
+#: the ledger is: this text goes into a prompt alongside a whole source file.
+ANCESTOR_MAX_DEPTH = 4
+
+
+def _ancestor_chain(node: Node, all_nodes: List[Node],
+                    max_depth: int = ANCESTOR_MAX_DEPTH) -> List[dict]:
+    """The chain from `node` up toward the root, newest first, excluding `node`.
+
+    AIRA's "ancestral memories for Debug" (arXiv:2507.02554). The repair
+    operator used to receive a traceback and a file and nothing else — not what
+    the edit was trying to do, not that its ancestors had already failed the
+    same way. It handled 7 of the 11 candidates in the recorded run, so the
+    majority path was the blind one.
+
+    Each entry carries what the two branches of the debug instruction need to be
+    distinguishable: the mechanism and evidence_type say whether the ancestor
+    failed to RUN (try a different implementation of the same idea) or ran and
+    scored WORSE (the mechanism is suspect, do not resurrect it), and
+    last_error_excerpt says how it broke.
+
+    Stops at the root, and is safe against a parent_id cycle — a malformed tree
+    must not hang an unattended run.
+    """
+    by_id = {n.id: n for n in all_nodes}
+    out: List[dict] = []
+    seen = {node.id}
+    cur = by_id.get(node.parent_id) if node.parent_id else None
+    while cur is not None and len(out) < max_depth and cur.id not in seen:
+        seen.add(cur.id)
+        out.append({
+            "id": cur.id,
+            "operation": cur.operation,
+            "mechanism": (cur.hypothesis or {}).get("mechanism"),
+            "evidence_type": cur.evidence_type,
+            "mean_delta": cur.mean_delta,
+            "last_error_excerpt": cur.last_error_excerpt,
+        })
+        cur = by_id.get(cur.parent_id) if cur.parent_id else None
+    return out
 
 
 def _prior_refines_for_component(component: str,
@@ -689,7 +806,12 @@ def _build_improve_candidates(parent: Node, *,
     candidates: List[Node] = []
     for h in hypotheses:
         fp = _fingerprint(h)
-        if memory.is_duplicate(fp):
+        # blocking_only: a family is retired only by a REFUTED verdict, not by
+        # any prior sighting. See Memory.is_duplicate — every scored candidate is
+        # recorded, most as `inconclusive`, so an unconditional match retired a
+        # family after one indecisive result even when the verdict step said
+        # retry_cheaper or build_on_it.
+        if memory.is_duplicate(fp, blocking_only=True):
             continue
         candidates.append(Node(
             id=_new_id(), parent_id=parent.id, code_path=parent.code_path,
@@ -1198,10 +1320,23 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             counters.bump("triage_runs")
             counters.bump_scorer("valid_search")
 
+            # Record HOW it failed before repairing, so this node's own chain
+            # entry is informative to its descendants even if every repair
+            # attempt below also fails. The TAIL of the log, because a Python
+            # traceback puts its cause at the end.
+            if res["status"] != "ok":
+                c.last_error_excerpt = (res.get("logs") or "")[-ANCESTOR_ERROR_CHARS:]
+
             while res["status"] != "ok" and c.fix_attempts < MAX_FIX_ATTEMPTS:
                 c.fix_attempts += 1
-                repair = codegen.debug_and_retry(c.code_path, res["logs"],
-                                                 root=cand_dir)
+                # hypothesis and ancestors: without them the repair model saw a
+                # traceback and a file, with no idea what the edit was trying to
+                # do or that its ancestors had already failed the same way. This
+                # operator handled 7 of the 11 candidates in the recorded run.
+                repair = codegen.debug_and_retry(
+                    c.code_path, res["logs"], root=cand_dir,
+                    hypothesis=c.hypothesis,
+                    ancestors=_ancestor_chain(c, all_nodes))
                 if repair.get("is_semantic_change"):
                     counters.bump("semantic_retries")
                 repair_diff = (repair.get("code_diff") or "").strip()
@@ -1220,6 +1355,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                                       root=cand_dir, data_dir=DATA_DIR)
                 counters.bump("triage_runs")
                 counters.bump_scorer("valid_search")
+                # Keep the excerpt on the LAST failure, not the first: after a
+                # repair the crash is usually somewhere else, and that later
+                # error is the one a descendant needs to avoid.
+                if res["status"] != "ok":
+                    c.last_error_excerpt = (
+                        res.get("logs") or "")[-ANCESTOR_ERROR_CHARS:]
             if res["status"] == "timeout":
                 # Distinct from "exec": the code was syntactically fine and ran,
                 # it just did not finish inside the cap. That calls for a cheaper
@@ -1233,6 +1374,10 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             if res["status"] != "ok":
                 return "exec"
 
+            # Repaired successfully, so this node did NOT fail. Clearing the
+            # excerpt keeps _ancestor_chain from telling a descendant that a
+            # working ancestor is broken.
+            c.last_error_excerpt = None
             c.partial_scores.append(res["metrics"]["primary"])
             c.per_seed_primary[0] = res["metrics"]["primary"]
             c.per_user_by_seed[0] = res["metrics"].get("per_user", {})
@@ -1303,6 +1448,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             mean_d, p_pos, lower_95 = bootstrap_delta(
                 c.per_user_by_seed, parent.per_user_by_seed)
             c.mean_delta, c.p_positive, c.lower_95 = mean_d, p_pos, lower_95
+
+            # Grade the measurement against the criterion this hypothesis
+            # declared before it was written. Nothing used to do this, so a
+            # +0.0006 against a stated +0.005 closed the node with exactly the
+            # same record as a mechanism that was never implemented.
+            _apply_verdict(c, parent, root, llm, counters, verbose=verbose)
 
             # Parent acceptance is a HILL-CLIMB step, not a significance test.
             # should_continue_locally (p_pos > 0.8 and lower_95 > 0) is kept in
@@ -1376,6 +1527,16 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                         print(f"  {c.id} confirm failed: paired delta "
                               f"{conf_mean:+.4f} lower95 {conf_lower:+.4f}")
 
+            # The verdict decides whether this entry RETIRES the mechanism
+            # family or merely records it. Only "abandon_mechanism" is a hard
+            # block (Memory.BLOCKING_EVIDENCE); "retry_cheaper" and
+            # "build_on_it" must leave the family proposable, which is why the
+            # dedup lookup above passes blocking_only=True instead of this
+            # branch simply skipping the record. The evidence is worth keeping
+            # either way — Tier 3A renders it back into the prompts.
+            _evidence = c.evidence_type or "inconclusive"
+            if c.next_action == "abandon_mechanism":
+                _evidence = "refuted_under_context"
             memory.record(EvidenceEntry(
                 fingerprint=_fingerprint(c.hypothesis),
                 architecture="FM",
@@ -1386,8 +1547,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 confidence_interval=(c.local_best_score - 0.005,
                                      c.local_best_score + 0.005),
                 code_hash=c.id,
-                evidence_type=c.evidence_type or "inconclusive",
-                note=c.hypothesis.get("mechanism", "")))
+                evidence_type=_evidence,
+                note=(c.verdict_reason or c.hypothesis.get("mechanism", ""))))
 
         # Prune the frontier to the best MAX_OPEN_NODES by scalar primary. The
         # root is never dropped, so the search can always fall back to a fresh

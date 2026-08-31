@@ -186,6 +186,50 @@ def validate_refinement(parsed: Any) -> Dict:
     }
 
 
+# ---------------------------------------------------------------------------
+# verdict()  — grade a measurement against the criterion it declared
+# ---------------------------------------------------------------------------
+
+_VERDICT_KEYS = ["verdict", "criterion_was_calibrated", "reason", "next_action"]
+
+_VERDICTS = ["met", "missed_but_promising", "refuted", "not_tested"]
+_NEXT_ACTIONS = ["retry_cheaper", "adjust_magnitude", "abandon_mechanism",
+                 "build_on_it"]
+
+
+def validate_verdict(parsed: Any) -> Dict:
+    """Validate a verdict, and reject the two combinations that are incoherent.
+
+    The cross-field checks are the point of this validator, not decoration.
+    "refuted" + criterion_was_calibrated=false says the mechanism was condemned
+    for missing a bar the grader itself judged unreachable, which is exactly the
+    failure the verdict step exists to prevent. And "not_tested" +
+    abandon_mechanism would hard-block a family that was never measured — a
+    permanent decision made on no evidence.
+    """
+    d = _require_dict(parsed)
+    _require_keys(d, _VERDICT_KEYS)
+    _reject_unknown_keys(d, _VERDICT_KEYS)
+    out = {
+        "verdict": _check_enum(d, "verdict", _VERDICTS),
+        "criterion_was_calibrated": _check_bool(d, "criterion_was_calibrated"),
+        "reason": _check_str(d, "reason"),
+        "next_action": _check_enum(d, "next_action", _NEXT_ACTIONS),
+    }
+    if out["verdict"] == "refuted" and not out["criterion_was_calibrated"]:
+        raise ValueError(
+            "verdict='refuted' with criterion_was_calibrated=false is "
+            "incoherent: a mechanism cannot be refuted for missing a criterion "
+            "you judged uncalibrated. Use 'missed_but_promising' instead.")
+    if out["verdict"] == "not_tested" and out["next_action"] == "abandon_mechanism":
+        raise ValueError(
+            "verdict='not_tested' with next_action='abandon_mechanism' is "
+            "incoherent: abandoning is a permanent block on the mechanism "
+            "family, and this mechanism was never measured. Use "
+            "'retry_cheaper'.")
+    return out
+
+
 def validate_hypothesis_list(parsed: Any, expected_count: int) -> List[Dict]:
     if not isinstance(parsed, list):
         raise ValueError(f"Expected a JSON array of hypotheses, got {type(parsed).__name__}.")

@@ -190,14 +190,76 @@ comment on the changed line, then return the COMPLETE updated {file_name} in one
 ```python block."""
 
 
-def build_debug_user(file_name: str, file_content: str, error_context: str) -> str:
+def build_ancestor_block(ancestors: list | None) -> str:
+    """Render a node's ancestor chain for the debug operator.
+
+    This is AIRA's "ancestral memories for Debug" (arXiv:2507.02554) — their
+    scoped-memory change to the Debug operator is what made advanced search
+    policies pay off at all. The repair model used to see a traceback and a
+    file, and nothing else: not what the edit was trying to do, and not that its
+    two ancestors had already failed the same way. That operator handled 7 of
+    the 11 candidates in the recorded run.
+
+    Returns "" for an empty chain, so a root-level repair prompt is unchanged.
+    """
+    if not ancestors:
+        return ""
+    lines = ["", "ANCESTRY of this candidate — newest first. Read it before you",
+             "choose a fix; it tells you which failures are already ruled out.",
+             ""]
+    for a in ancestors:
+        lines.append(f"- {a.get('id', '?')} ({a.get('operation', 'improve')})")
+        if a.get("mechanism"):
+            lines.append(f"    mechanism: {a['mechanism']}")
+        if a.get("evidence_type"):
+            lines.append(f"    outcome:   {a['evidence_type']}")
+        if a.get("mean_delta") is not None:
+            lines.append(f"    paired delta vs its parent: {a['mean_delta']:+.5f}")
+        if a.get("last_error_excerpt"):
+            excerpt = " ".join(str(a["last_error_excerpt"]).split())
+            lines.append(f"    failed with: {excerpt}")
+    lines += [
+        "",
+        "How to use this, and the distinction matters:",
+        "- An ancestor that FAILED TO RUN (failed_implementation, timeout) means",
+        "  the mechanism was never measured. Do not abandon the idea — write a",
+        "  DIFFERENT, cheaper implementation of the same mechanism, and do not",
+        "  reproduce the construct that broke.",
+        "- An ancestor that RAN BUT SCORED WORSE (a negative paired delta) means",
+        "  the mechanism itself is suspect. A repair must NOT resurrect it: fix",
+        "  only what crashes, and leave the failing mechanism no larger than the",
+        "  ancestor already made it.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
+def build_debug_user(file_name: str, file_content: str, error_context: str,
+                     hypothesis: dict | None = None,
+                     ancestors: list | None = None) -> str:
+    """`hypothesis` and `ancestors` are optional so the frozen 3-positional-arg
+    form keeps working; codegen/tests and debug_and_retry's 2-argument contract
+    both depend on it."""
+    intent = ""
+    if hypothesis:
+        intent = f"""
+This candidate was trying to implement:
+{hypothesis.get('mechanism', '(none provided)')}
+
+Implementation sketch it was written from:
+{hypothesis.get('implementation_sketch', '(none provided)')}
+
+Fix the failure while KEEPING that mechanism in place. A repair that quietly
+reverts the mechanism to make the file run is worse than the crash: it scores
+identically to the parent and is recorded as the mechanism having been tried.
+"""
     return f"""\
 File: {file_name}
 The candidate failed. Error / divergence context:
 ```
 {error_context}
 ```
-
+{intent}{build_ancestor_block(ancestors)}
 Current {file_name} content:
 ```python
 {file_content}

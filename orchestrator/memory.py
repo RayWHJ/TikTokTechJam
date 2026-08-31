@@ -85,10 +85,34 @@ class Memory:
                   "ranking — a pointwise GBDT spends its capacity on between-user "
                   "variance the metric ignores.")))
 
-    def is_duplicate(self, fingerprint: Fingerprint) -> Optional[EvidenceEntry]:
+    #: Evidence types that make a fingerprint a HARD BLOCK on re-proposal.
+    #: Everything else — inconclusive, failed_implementation, timeout, no_op — is
+    #: a record of what happened, not a verdict that the mechanism is dead.
+    BLOCKING_EVIDENCE = ("refuted_under_context", "invariant")
+
+    def is_duplicate(self, fingerprint: Fingerprint,
+                     blocking_only: bool = False) -> Optional[EvidenceEntry]:
+        """Find a prior entry with this fingerprint, if any.
+
+        `blocking_only=True` restricts the match to BLOCKING_EVIDENCE. The
+        driver's proposal path uses it, and the distinction is load-bearing:
+        every scored candidate is recorded here, and most are recorded as
+        `inconclusive` because they neither promoted nor refuted anything. With
+        an unconditional match, one inconclusive result permanently retired a
+        whole mechanism family — including a family the verdict step judged
+        `retry_cheaper` (the implementation failed, the idea is untested) or
+        `build_on_it` (it worked, keep going). Both are cases where you
+        specifically want to propose in that family again.
+
+        Default stays False so the plain "have I seen this fingerprint at all"
+        question still has an answer.
+        """
         for e in self.entries:
-            if tuple(e.fingerprint) == tuple(fingerprint):
-                return e
+            if tuple(e.fingerprint) != tuple(fingerprint):
+                continue
+            if blocking_only and e.evidence_type not in self.BLOCKING_EVIDENCE:
+                continue
+            return e
         return None
 
     def record(self, entry: EvidenceEntry):

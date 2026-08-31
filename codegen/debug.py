@@ -108,6 +108,7 @@ def debug_and_retry(code_path: str, error_context: str, *,
                     history: list | None = None,
                     threshold: float | None = None,
                     hypothesis: dict | None = None,
+                    ancestors: list | None = None,
                     max_retries: int = 2) -> dict:
     """Repair a failed candidate and/or sanity-check a suspicious result.
 
@@ -115,6 +116,15 @@ def debug_and_retry(code_path: str, error_context: str, *,
     the keyword args enable the sanity-check path and let the orchestrator inject
     a real client. `root` is where the repair diff is validated; it defaults to
     code_path's own directory.
+
+    `hypothesis` and `ancestors` scope the repair prompt. Both were already
+    reachable in this signature or trivially addable, and the driver passed
+    neither: the repair model saw a traceback and a file, with no idea what the
+    edit was trying to do or that its ancestors had failed the same way. Since
+    this operator handled 7 of the 11 candidates in the recorded run (6
+    failed_implementation, 1 timeout), it was the majority path and it was
+    running blind. `ancestors` comes from
+    orchestrator.driver._ancestor_chain — newest first.
 
     Returns at least {"code_diff": str, "is_semantic_change": bool}. When the
     sanity path runs, also includes {"sanity": {...}, "leak_suspected": bool}.
@@ -134,7 +144,8 @@ def debug_and_retry(code_path: str, error_context: str, *,
     # would re-execute the same broken code. Each retry carries the concrete
     # rejection reason, which is what makes it worth spending at temperature 0.
     code_diff = ""
-    user = prompts.build_debug_user(fname, content, error_context)
+    user = prompts.build_debug_user(fname, content, error_context,
+                                    hypothesis=hypothesis, ancestors=ancestors)
     err = ""
     for attempt in range(1, max(1, max_retries) + 1):
         msg = user if attempt == 1 else \

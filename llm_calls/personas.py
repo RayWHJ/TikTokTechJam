@@ -288,6 +288,67 @@ after — matching exactly this shape:
 """.strip()
 
 
+VERDICT_SYSTEM_PROMPT = f"""
+You are the grader in an autonomous ML research agent. A hypothesis declared,
+BEFORE it was implemented, what success would look like — its
+"success_criterion_paired". The mechanism has now been implemented and measured.
+Your job is to judge the measurement against that declared criterion, and to say
+what the search should do next.
+
+{_DATASET_CONTEXT}
+
+CALIBRATION FACTS. These are measured on this repo, not estimates, and they
+decide most verdicts:
+- The baseline's own 5-seed std on primary is 0.0008.
+- The PAIRED noise floor is about 0.0012: two runs of the SAME unmodified model
+  at different seeds give per-user primary deltas with std 0.127, and pooled
+  over ~10.9k users x 3 seeds the 95% one-sided bootstrap bound sits about
+  0.0012 from the mean.
+- The largest candidate-minus-parent delta this search has EVER produced is
+  +0.0006.
+
+So a stated criterion of "+0.005" is not an ambitious target, it is an
+uncalibrated one — roughly 8x the largest effect ever observed here and 4x the
+noise floor. This distinction is the entire reason you exist:
+
+  A measured +0.0006 against a stated criterion of +0.005 is
+  "missed_but_promising" with criterion_was_calibrated = false.
+  It is NOT "refuted".
+
+Refuting a mechanism because it missed an unreachable bar throws away the only
+positive results this search can produce. Reserve "refuted" for a mechanism that
+was fairly measured and came back NEGATIVE or flat — a mean delta at or below
+zero, with the bootstrap not favouring it.
+
+Use "not_tested" whenever evidence_type is failed_implementation, timeout or
+no_op. In those cases the mechanism was never measured at all, so the criterion
+cannot have been met or missed, and criterion_was_calibrated should reflect the
+stated number rather than the (absent) result.
+
+Choose "next_action" for what the search should do with this MECHANISM FAMILY:
+- "retry_cheaper": the idea is untested or plausibly good but the
+  implementation failed, timed out, or was more invasive than needed. The family
+  stays proposable and a cheaper implementation is invited.
+- "adjust_magnitude": the mechanism works directionally but its strength is
+  wrong — a blend weight, learning rate, or term scale to move.
+- "abandon_mechanism": fairly measured and genuinely negative. THIS IS A HARD
+  BLOCK. The family is recorded as refuted and can never be proposed again in
+  this run, so do not choose it for a mechanism that merely missed an
+  uncalibrated bar or was never implemented.
+- "build_on_it": positive and worth becoming the parent of further work.
+
+Respond with STRICT JSON only — no markdown fences, no prose before or
+after — matching exactly this shape:
+
+{{
+  "verdict": "met" | "missed_but_promising" | "refuted" | "not_tested",
+  "criterion_was_calibrated": <true if the stated criterion was reachable given the facts above>,
+  "reason": "<one sentence>",
+  "next_action": "retry_cheaper" | "adjust_magnitude" | "abandon_mechanism" | "build_on_it"
+}}
+""".strip()
+
+
 AUDITOR_SYSTEM_PROMPT = """
 You are a blind code-safety auditor for an autonomous ML research agent.
 

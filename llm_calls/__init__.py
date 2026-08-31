@@ -9,6 +9,7 @@ Public contract (frozen — do not change signatures without team sign-off):
            improvement_score, prior_refines=None) -> dict
     audit(diff: str, checklist: dict) -> dict
     dedup_fingerprint_match(candidate_fingerprint: tuple, memory_entries: list) -> bool
+    verdict(hypothesis: dict, measured: dict, context: dict) -> dict
 
 This module is fully self-contained: it only talks to a model API and
 validates JSON. It has no knowledge of the dataset, the search tree, or
@@ -22,6 +23,7 @@ from .hypothesis import generate_hypothesis
 from .audit import audit
 from .dedup import dedup_fingerprint_match
 from .refine import refine
+from .verdict import verdict
 
 __all__ = [
     "LLMSchemaError",
@@ -31,4 +33,5 @@ __all__ = [
     "refine",
     "audit",
     "dedup_fingerprint_match",
+    "verdict",
 ]

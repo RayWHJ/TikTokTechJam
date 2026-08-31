@@ -92,6 +92,43 @@ def refine(component, component_source, ablations, iter_history,
     }
 
 
+def verdict(hypothesis, measured, context):
+    """Mock of llm_calls.verdict — derived from the measurement, not canned.
+
+    Deliberately reproduces the ONE distinction the real persona exists to make:
+    a positive-but-small delta against a criterion stating +0.005 is
+    `missed_but_promising` with criterion_was_calibrated=False, never `refuted`.
+    A mock that always returned "refuted" would make a mocked run close every
+    node the same way and hide whether the driver routes the four next_actions
+    differently.
+
+    Thresholds are the repo's measured ones: 0.0012 is the paired noise floor,
+    0.0008 the baseline's 5-seed std.
+    """
+    if measured.get("evidence_type") in ("failed_implementation", "timeout",
+                                         "no_op"):
+        return {"verdict": "not_tested", "criterion_was_calibrated": False,
+                "reason": "the mechanism never ran, so it was never measured",
+                "next_action": "retry_cheaper"}
+    delta = measured.get("mean_delta") or 0.0
+    stated = hypothesis.get("success_criterion_paired", "")
+    calibrated = not any(t in stated for t in ("0.005", "0.004", "0.006",
+                                              "0.007"))
+    if delta >= 0.0012:
+        return {"verdict": "met", "criterion_was_calibrated": calibrated,
+                "reason": "paired delta clears the 0.0012 noise floor",
+                "next_action": "build_on_it"}
+    if delta > 0:
+        return {"verdict": "missed_but_promising",
+                "criterion_was_calibrated": calibrated,
+                "reason": ("positive but inside the 0.0012 paired noise floor; "
+                           "the stated bar was not reachable"),
+                "next_action": "adjust_magnitude"}
+    return {"verdict": "refuted", "criterion_was_calibrated": True,
+            "reason": "paired delta is at or below zero on a fair measurement",
+            "next_action": "abandon_mechanism"}
+
+
 def audit(diff, checklist):
     """Blind — sees only the diff."""
     violations = []

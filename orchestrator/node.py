@@ -63,3 +63,26 @@ class Node:
     # Directory holding this node's staged, already-patched source tree. The
     # root's is the repo itself.
     code_dir: str = "."
+
+    # Tail of the run log from this node's last failed execute(), truncated.
+    # The TAIL specifically, because a Python traceback puts its cause last.
+    #
+    # Exists so driver._ancestor_chain can tell the debug operator not just that
+    # an ancestor failed but HOW. Before this the per-attempt failure reason
+    # lived only in the run log, never on the Node, so nothing downstream could
+    # read it: 6 of the 11 candidates in orchestrator/_state/nodes.jsonl were
+    # filed as failed_implementation and 1 as timeout, and every repair attempt
+    # on them started from a blank slate.
+    last_error_excerpt: Optional[str] = None
+
+    # Verdict on this node's own declared success_criterion_paired, from
+    # llm_calls.verdict. Every hypothesis in the recorded run stated a criterion
+    # between +0.004 and +0.007 and nothing ever checked it, so "the mechanism
+    # was refuted", "the mechanism was never fairly implemented" and "the
+    # criterion was uncalibrated by 8x" all collapsed into one record.
+    verdict: Optional[str] = None          # met | missed_but_promising
+                                           # | refuted | not_tested
+    verdict_reason: Optional[str] = None
+    next_action: Optional[str] = None      # retry_cheaper | adjust_magnitude
+                                           # | abandon_mechanism | build_on_it
+    criterion_was_calibrated: Optional[bool] = None
