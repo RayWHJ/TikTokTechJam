@@ -41,6 +41,12 @@ class Node:
     partial_scores: List[float] = field(default_factory=list)
     per_user_by_seed: Dict[int, Dict[str, float]] = field(default_factory=dict)
     wallclock_used_s: float = 0.0
+
+    # Seconds this node's last SUCCESSFUL run took, measured. The adaptive triage
+    # cap for its children is derived from it (driver._triage_cap_for), so a
+    # promoted candidate that is itself slower than the root does not silently
+    # make every child of it time out.
+    clean_runtime_s: Optional[float] = None
     n_visits: int = 0
 
     # Per-seed primary, so a node's scalar score can be a MEAN over the seeds it
@@ -48,6 +54,19 @@ class Node:
     # (a triage-only candidate) handed the root a measured +0.00033 head start —
     # see driver._scalar_primary for the arithmetic on the real cached baseline.
     per_seed_primary: Dict[int, float] = field(default_factory=dict)
+
+    # The two metrics primary is the mean of, kept SEPARATELY per seed.
+    #
+    # Every number the diagnostician saw used to be the scalar primary, so a
+    # change that gained on GAUC and lost on nDCG@5 was indistinguishable from a
+    # change that did nothing. The headroom is also lopsided — GAUC has 0.3390 to
+    # its ceiling of 1.0, nDCG@5 has 0.2007 to its ceiling of 0.7289 — and the
+    # model cannot target the larger gap when it cannot see either number.
+    #
+    # Section 2.5 also requires per-iteration GAUC / nDCG@5 in the submitted run
+    # log, which a primary-only schema cannot produce.
+    per_seed_gauc: Dict[int, float] = field(default_factory=dict)
+    per_seed_ndcg5: Dict[int, float] = field(default_factory=dict)
 
     # Paired candidate-vs-parent statistics from promotion.bootstrap_delta.
     # Cached on the node so progress.json can report WHY a candidate was kept or
@@ -59,6 +78,12 @@ class Node:
     # Primary on the sealed valid_confirm split, set only when a promotion
     # attempt actually spends a confirm query.
     confirm_primary: Optional[float] = None
+
+    # Primary the LABEL-PERMUTATION control scored (T3.4): the same candidate
+    # re-run with each user's labels shuffled among that user's own rows. A clean
+    # candidate collapses to chance (~0.484 measured); one reading the label keeps
+    # its score. Recorded on the node so the run log can show the pair.
+    permuted_primary: Optional[float] = None
 
     # Directory holding this node's staged, already-patched source tree. The
     # root's is the repo itself.

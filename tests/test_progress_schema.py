@@ -91,7 +91,7 @@ def _install(monkeypatch, tmp_path, script):
                 "edit_radius": "small", "expected_cost": "medium",
                 "incompatibilities": [], "uncertainty": 0.25}
 
-    def generate_hypothesis(diagnosis, evidence_card, tried=None):
+    def generate_hypothesis(diagnosis, evidence_card, tried=None, **kw):
         # loss_type and mechanism both carry the iteration index: the former
         # keeps _fingerprint unique so memory dedup doesn't swallow iteration 2
         # onward, the latter keeps the written diff unique so the run-wide
@@ -104,7 +104,7 @@ def _install(monkeypatch, tmp_path, script):
                  "feature_set": "5field_baseline", "dataset_tier": "pure"}]
 
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         is_candidate = "candidate_" in str(code_path)
         # Candidates score the baseline on valid_confirm, so the paired confirm
         # delta is 0 and nothing promotes. That keeps `baseline` pinned to

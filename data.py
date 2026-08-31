@@ -4,14 +4,77 @@ encode()     : FM 的 5 个类别域 -> 连续 id。只依赖标准库和 numpy�
 encode_lgb() : GBDT 的稠密数值特征（train-only 统计量）。同样只依赖 numpy。
 """
 import csv, os, collections, itertools
+from typing import Callable, List, Tuple
 import numpy as np
 
 LABEL = 'long_view'
 SPLITS = {'train': (20220408, 20220421),
           'valid': (20220422, 20220428),
           'test':  (20220429, 20220508)}
-# 5 个特征域。想加特征就往这里加 —— 这是学生最该动的地方之一。
-FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
+
+#: The 5 categorical domains encode()'s inner raw(x) reads off a row directly.
+#: These are positional and pinned — raw(x) returns them in this order.
+BASE_FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
+
+#: THE FRONT DOOR FOR A NEW CATEGORICAL FIELD. Append `(name, fn)` and you are
+#: done: X's width, the vocabulary list, the UNK slots, field_dims, offsets and
+#: the X allocation all follow from this one list.
+#:
+#: `fn(rows) -> sequence of len(rows) values`, computed ONCE PER SPLIT and
+#: VECTORISED, not once per row. Two reasons that shape and not `fn(x)`:
+#:
+#:  1. It is what a LAG feature needs. "The user's previous video_id" cannot be
+#:     computed from a row in isolation, and it is the most-proposed direction in
+#:     this repo. A per-split callable sees exactly the rows of one split, which
+#:     makes split-locality structural rather than something the author has to
+#:     remember.
+#:  2. A per-row Python callable over 1.4M rows is the timeout that killed a
+#:     candidate in the recorded run. Handing the whole split over at once lets
+#:     the implementation be numpy.
+#:
+#: Values are coerced with str() and mapped through a TRAIN-ONLY vocabulary, so
+#: an unseen value lands in that field's UNK slot automatically.
+#:
+#: WHY THIS EXISTS. Adding one categorical field used to be a coupled four-place
+#: edit — FIELDS, raw(), the vocab list and the X allocation — with no single
+#: point of change. Two candidates in the recorded run died with the IDENTICAL
+#: IndexError inside `for i, v in enumerate(raw(x))`, having extended raw(x) and
+#: not FIELDS. Three of five candidates never produced a paired delta, so that
+#: one coupling consumed more search budget than every measurement combined.
+EXTRA_FIELDS: List[Tuple[str, Callable]] = []
+
+#: All categorical domains, base plus registered extras. Derived, never edited by
+#: hand. Kept a module-level list with this name because baseline.py imports it
+#: and the proposer/writer prompts quote it verbatim.
+FIELDS = BASE_FIELDS + [n for n, _ in EXTRA_FIELDS]
+
+
+def active_fields() -> List[str]:
+    """The field list in effect for an encode() call, right now.
+
+    Reconciles the module-level FIELDS with EXTRA_FIELDS rather than trusting
+    either alone, so BOTH ways in work: `add_categorical_field(...)` (which keeps
+    the two in sync) and a bare `EXTRA_FIELDS.append(...)` by a candidate that
+    never touched FIELDS.
+    """
+    names = list(FIELDS)
+    for name, _fn in EXTRA_FIELDS:
+        if name not in names:
+            names.append(name)
+    return names
+
+
+def add_categorical_field(name: str, fn: Callable) -> None:
+    """Register one new fixed-width categorical field. The whole edit.
+
+    `fn(rows)` returns one value per row of the split it is handed — see
+    EXTRA_FIELDS for the contract and why it is per-split rather than per-row.
+    """
+    if name in active_fields():
+        raise ValueError(f"field {name!r} is already registered: {active_fields()}")
+    EXTRA_FIELDS.append((name, fn))
+    if name not in FIELDS:
+        FIELDS.append(name)
 
 #: 'train' re-cut by date into the rows a model FITS on and the rows it
 #: EARLY-STOPS on. These two partition SPLITS['train'] exactly; 'train' itself
@@ -164,35 +227,244 @@ def aux_targets(splits):
     return out
 
 
+# --------------------------------------------------------------------------- #
+#  Verified primitives the writer composes (T2.10)                             #
+# --------------------------------------------------------------------------- #
+# WHY THESE EXIST. Three of the five proposals in the recorded run needed exactly
+# a previous-value-within-user computation, and the one that got the semantics
+# right timed out implementing it in a Python loop over 1.4M rows. These turn the
+# hardest part of the most-proposed direction into one call, with causality and
+# split boundaries already correct — and they narrow what the static gate and the
+# auditor have to reason about, because a known-safe primitive replaces novel
+# indexing code on every attempt.
+#
+# Each one is SPLIT-LOCAL by construction: it is handed one split's rows and can
+# see nothing else. And each is POINT-IN-TIME safe: it reads only rows strictly
+# before the row it describes. tests/test_primitives.py asserts both.
+
+def prev_value_within_user(rows, key=2, missing='NONE'):
+    """The user's PREVIOUS value of column `key`, in date order. One per row.
+
+    `key` is an index into the row tuple — 2 is video_id, 3 is author_id,
+    6 is the long_view label, 4 is tab. Returns a list of strings aligned
+    row-for-row with `rows` AS GIVEN, so it plugs straight into EXTRA_FIELDS.
+
+    CAUSALITY. Rows are ranked by date within each user and each row is described
+    by the value from the row before it, so the first impression a user has in
+    this split gets `missing`. A row is never described by itself or by anything
+    after it. Ties on date keep the order they appear in `rows`, which is the
+    logged order — `sorted` is stable.
+
+    SPLIT-LOCALITY. Only `rows` is visible, so a valid-split row's "previous"
+    value never reaches back into train. That is deliberate and it is the
+    conservative direction: it under-informs the first row of each user per
+    split rather than leaking across the boundary.
+
+    Cost is one sort plus one pass — no per-row Python callback into numpy, which
+    is what timed out at 240s over 1.4M rows.
+    """
+    order = sorted(range(len(rows)), key=lambda i: rows[i][0])
+    out = [missing] * len(rows)
+    last = {}
+    for i in order:
+        u = rows[i][1]
+        if u in last:
+            out[i] = last[u]
+        last[u] = str(rows[i][key])
+    return out
+
+
+def prior_count_within_user(rows, key=3, buckets=(0, 1, 2, 5)):
+    """How many times this user has ALREADY seen `rows[i][key]`, bucketed.
+
+    Returns a list of bucket labels as strings, aligned with `rows`. The count is
+    strictly prior: the current row is not counted in its own feature.
+
+    Bucketed rather than raw because a raw count is a high-cardinality integer
+    domain in a fixed-width categorical field, and the FM would spend an
+    embedding per distinct count. `buckets` are lower bounds, so the default
+    gives 0 / 1 / 2 / 3-5 / 6+.
+    """
+    order = sorted(range(len(rows)), key=lambda i: rows[i][0])
+    out = [''] * len(rows)
+    seen = collections.Counter()
+    for i in order:
+        k = (rows[i][1], rows[i][key])
+        n = seen[k]
+        label = str(buckets[-1]) + '+'
+        for b_i, b in enumerate(buckets):
+            nxt = buckets[b_i + 1] if b_i + 1 < len(buckets) else None
+            if nxt is None:
+                if n >= b:
+                    label = f'{b}+'
+                break
+            if b <= n < nxt:
+                label = str(b) if nxt == b + 1 else f'{b}-{nxt - 1}'
+                break
+        out[i] = label
+        seen[k] = n + 1
+    return out
+
+
+def position_within_user(rows, buckets=(0, 1, 2, 5, 10, 20)):
+    """The row's 0-based position in this user's log for this split, bucketed.
+
+    A coarse "how deep into the session are we" field. Uses only rows at or
+    before the current row — the position of row i depends on how many of this
+    user's rows precede it, never on how many follow.
+    """
+    order = sorted(range(len(rows)), key=lambda i: rows[i][0])
+    out = [''] * len(rows)
+    seen = collections.Counter()
+    for i in order:
+        u = rows[i][1]
+        n = seen[u]
+        label = f'{buckets[-1]}+'
+        for b_i, b in enumerate(buckets):
+            nxt = buckets[b_i + 1] if b_i + 1 < len(buckets) else None
+            if nxt is None:
+                if n >= b:
+                    label = f'{b}+'
+                break
+            if b <= n < nxt:
+                label = str(b) if nxt == b + 1 else f'{b}-{nxt - 1}'
+                break
+        out[i] = label
+        seen[u] = n + 1
+    return out
+
+
+def within_user_pairs(users, y, rng, max_pairs_per_user=8):
+    """Vectorised (positive_row, negative_row) index pairs, sampled within user.
+
+    Returns (pos_idx, neg_idx) as int64 arrays into the SAME rows `users`/`y`
+    describe, for a pairwise loss (BPR, RankNet) or a within-user softmax.
+
+    This is the other computation the recorded run kept needing and kept getting
+    wrong. It is fully vectorised: one lexsort, then numpy indexing. A per-user
+    Python loop over 1.4M rows is the 240s timeout.
+
+    RNG. Takes its generator as an ARGUMENT and never touches np.random or
+    run_fm's own `rng`. That is a hard rule here, not hygiene: the orchestrator
+    pairs a candidate against its parent SEED BY SEED, which only cancels noise
+    while both runs consume the same draws in the code they share. One extra draw
+    from the shared `rng` shifts every later epoch shuffle, the trajectories
+    decorrelate, and the inflated paired variance is indistinguishable from a real
+    effect. codegen/gate.py rejects a diff that draws from the wrong generator.
+    Call it as `within_user_pairs(users, y, np.random.default_rng(seed + 1000))`.
+
+    Users with no positive or no negative contribute no pairs, which is correct:
+    they carry no within-user ranking signal and GAUC excludes them too.
+    """
+    users = np.asarray(users)
+    y = np.asarray(y)
+    # Group rows by user without a Python loop: sort by user, then slice runs.
+    order = np.argsort(users, kind='stable')
+    su = users[order]
+    starts = np.flatnonzero(np.r_[True, su[1:] != su[:-1]])
+    ends = np.r_[starts[1:], len(su)]
+
+    pos_out, neg_out = [], []
+    for s, e in zip(starts, ends):
+        idx = order[s:e]
+        yy = y[idx]
+        p = idx[yy > 0]
+        n = idx[yy <= 0]
+        if not len(p) or not len(n):
+            continue
+        k = min(max_pairs_per_user, max(len(p), len(n)))
+        pos_out.append(rng.choice(p, size=k, replace=len(p) < k))
+        neg_out.append(rng.choice(n, size=k, replace=len(n) < k))
+    if not pos_out:
+        empty = np.empty(0, dtype=np.int64)
+        return empty, empty
+    return (np.concatenate(pos_out).astype(np.int64),
+            np.concatenate(neg_out).astype(np.int64))
+
+
 def _bucket_edges(durations, n=10):
     return np.quantile(np.asarray(durations), np.linspace(0, 1, n + 1)[1:-1])
 
 def encode(splits):
     """把类别特征映射成连续 id。未见过的取值统一落到该域的 UNK 槽。
-    返回 (X, y, users) per split，X 为 int32 (N, len(FIELDS))，以及 field_dims。"""
+    返回 (X, y, users) per split，X 为 int32 (N, len(FIELDS))，以及 field_dims。
+
+    To add a categorical field, append to EXTRA_FIELDS (or call
+    add_categorical_field). Everything below — the vocabularies, the UNK slots,
+    field_dims, offsets and X's width — is derived from `fields`, so that append
+    is the entire change. Do not extend raw(x) by hand: raw(x) covers
+    BASE_FIELDS and only BASE_FIELDS, and returning an extra value from it is
+    what produced the two identical IndexErrors in the recorded run.
+    """
+    fields = active_fields()
     tr = splits['train']
     edges = _bucket_edges([x[5] for x in tr])
 
     def raw(x):
         return [x[1], x[2], x[3], x[4], str(int(np.searchsorted(edges, x[5])))]
 
-    vocabs = [dict() for _ in FIELDS]
-    for x in tr:
+    # Where each registered extra lands in `fields`. By NAME, not by position:
+    # a candidate may have appended to FIELDS as well, and a shifted index would
+    # write the new feature into an existing field's column.
+    extra_at = {name: fields.index(name) for name, _fn in EXTRA_FIELDS}
+
+    def extra_columns(rws):
+        """EXTRA_FIELDS as string columns for one split. One call per field per
+        split, so the implementation can be vectorised."""
+        cols = {}
+        for name, fn in EXTRA_FIELDS:
+            vals = list(fn(rws))
+            assert len(vals) == len(rws), (
+                f"EXTRA_FIELDS[{name!r}] returned {len(vals)} values for a "
+                f"split of {len(rws)} rows; it must return exactly one value "
+                f"per row, in row order")
+            cols[extra_at[name]] = [str(v) for v in vals]
+        return cols
+
+    if tr:
+        n_raw = len(raw(tr[0]))
+        assert n_raw <= len(fields), (
+            f"encode()'s raw(x) returns {n_raw} values but there are "
+            f"{len(fields)} fields, so {n_raw - len(fields)} value(s) would be "
+            f"written past X's last column — this is the IndexError in "
+            f"`for i, v in enumerate(raw(x))` that killed two candidates in the "
+            f"recorded run. Register the new field in EXTRA_FIELDS instead of "
+            f"extending raw(x).\n"
+            f"  fields ({len(fields)}): {fields}\n"
+            f"  raw(x) ({n_raw}): {raw(tr[0])}")
+
+    vocabs = [dict() for _ in fields]
+    tr_extra = extra_columns(tr)
+    for n, x in enumerate(tr):
         for i, v in enumerate(raw(x)):
             if v not in vocabs[i]:
                 vocabs[i][v] = len(vocabs[i])
+        for i, col in tr_extra.items():
+            if col[n] not in vocabs[i]:
+                vocabs[i][col[n]] = len(vocabs[i])
     unk = [len(v) for v in vocabs]                 # 每个域末尾留一个 UNK 槽
     field_dims = [len(v) + 1 for v in vocabs]
     offsets = np.cumsum([0] + field_dims[:-1]).astype(np.int32)
 
     enc = {}
     for name, rws in splits.items():
-        X = np.empty((len(rws), len(FIELDS)), dtype=np.int32)
+        cols = tr_extra if rws is tr else extra_columns(rws)
+        X = np.empty((len(rws), len(fields)), dtype=np.int32)
+        # Pre-fill every column with its own UNK id. Only matters for a field
+        # that has NO value source — a name appended to FIELDS with no matching
+        # EXTRA_FIELDS entry — which previously left that column as np.empty's
+        # uninitialized memory and fed the FM garbage indices. Now it degrades to
+        # a constant UNK embedding: still useless, but deterministic and
+        # harmless instead of undefined.
+        for i in range(len(fields)):
+            X[:, i] = unk[i] + offsets[i]
         y = np.empty(len(rws), dtype=np.float32)
         users = []
         for n, x in enumerate(rws):
             for i, v in enumerate(raw(x)):
                 X[n, i] = vocabs[i].get(v, unk[i]) + offsets[i]
+            for i, col in cols.items():
+                X[n, i] = vocabs[i].get(col[n], unk[i]) + offsets[i]
             y[n] = x[6]
             users.append(x[1])
         enc[name] = (X, y, users)

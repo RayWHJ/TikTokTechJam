@@ -31,11 +31,6 @@ _SEMANTIC_TOKENS = re.compile(
     r"\bFIELDS\b|feature|embed|\bk\s*=|lr\s*=|learning_rate|schedule|epochs?\b|"
     r"optimizer|adam|momentum|dropout|regulari|objective|margin|temperature)",
     re.IGNORECASE)
-# tokens typical of a pure crash fix
-_CRASHFIX_TOKENS = re.compile(
-    r"(axis|shape|reshape|dtype|import|indent|typo|NameError|IndexError|"
-    r"KeyError|TypeError|None check|off-by-one|parenthes|syntax)", re.IGNORECASE)
-
 
 def _diff_added_removed(diff: str) -> str:
     return "\n".join(l[1:] for l in diff.splitlines()
@@ -109,6 +104,7 @@ def debug_and_retry(code_path: str, error_context: str, *,
                     threshold: float | None = None,
                     hypothesis: dict | None = None,
                     ancestors: list | None = None,
+                    prior_failures: list | None = None,
                     max_retries: int = 2) -> dict:
     """Repair a failed candidate and/or sanity-check a suspicious result.
 
@@ -116,6 +112,13 @@ def debug_and_retry(code_path: str, error_context: str, *,
     the keyword args enable the sanity-check path and let the orchestrator inject
     a real client. `root` is where the repair diff is validated; it defaults to
     code_path's own directory.
+
+    `prior_failures` is the run-wide failure digest's entries matching THIS
+    failure's (file, exception, line) signature — see
+    orchestrator.driver.FailureDigest. It is the sibling counterpart to
+    `ancestors`: the two identical `encode` crashes in the recorded run were both
+    children of the root, so no ancestor walk could show either one the other's
+    traceback.
 
     `hypothesis` and `ancestors` scope the repair prompt. Both were already
     reachable in this signature or trivially addable, and the driver passed
@@ -145,7 +148,8 @@ def debug_and_retry(code_path: str, error_context: str, *,
     # rejection reason, which is what makes it worth spending at temperature 0.
     code_diff = ""
     user = prompts.build_debug_user(fname, content, error_context,
-                                    hypothesis=hypothesis, ancestors=ancestors)
+                                    hypothesis=hypothesis, ancestors=ancestors,
+                                    prior_failures=prior_failures)
     err = ""
     for attempt in range(1, max(1, max_retries) + 1):
         msg = user if attempt == 1 else \
@@ -163,20 +167,56 @@ def debug_and_retry(code_path: str, error_context: str, *,
     result = {"code_diff": code_diff, "is_semantic_change": is_semantic_change(code_diff)}
 
     # ---- sanity-check path (only when a score was supplied) -------------- #
-    if observed_score is not None and _looks_implausible(observed_score, history, threshold):
-        suser = prompts.build_sanity_user(code_diff or "(no diff)",
-                                          hypothesis or {}, observed_score,
-                                          history, threshold or ORACLE_PRIMARY_CEILING)
-        sraw = client.complete(prompts.SANITY_SYSTEM, suser, kind=KIND_SANITY,
-                               max_tokens=800, temperature=0.0)
-        try:
-            verdict = json.loads(sraw)
-        except Exception:
-            verdict = {"implements_hypothesis": False, "leak_suspected": True,
-                       "reasoning": "sanity model returned unparseable output; "
-                                    "blocking as a precaution.",
-                       "raw": sraw[:500]}
+    verdict = sanity_check(code_diff, hypothesis=hypothesis,
+                           observed_score=observed_score, history=history,
+                           threshold=threshold, client=client)
+    if verdict is not None:
         result["sanity"] = verdict
         result["leak_suspected"] = bool(verdict.get("leak_suspected", True))
 
     return result
+
+
+def sanity_check(code_diff: str | None, *, hypothesis: dict | None = None,
+                 observed_score: float | None = None,
+                 history: list | None = None,
+                 threshold: float | None = None,
+                 client: LLMClient | None = None) -> dict | None:
+    """Judge an implausibly-good result. Returns a verdict dict, or None.
+
+    Returns None — and makes NO model call — unless the score actually looks
+    implausible (`_looks_implausible`: above the oracle ceiling, above an explicit
+    threshold, or a >0.02 leap over the best prior). So on a normal run this costs
+    nothing.
+
+    Extracted from `debug_and_retry` (T3.5) because that is why the branch was
+    unreachable rather than merely unused: `debug_and_retry` runs its REPAIR loop
+    first, so calling it on a candidate that SUCCEEDED would spend a writer call
+    trying to repair working code. The driver could not use it, and so never
+    passed `observed_score` — leaving `ORACLE_PRIMARY_CEILING` checkable only from
+    here and checked nowhere.
+
+    Advisory. The deterministic controls in
+    `orchestrator/driver.py::_leak_check` — the oracle ceiling and the
+    label-permutation control — are the gatekeepers; this adds the one judgement
+    they cannot make, namely whether the diff implements the stated mechanism at
+    all.
+    """
+    if observed_score is None or not _looks_implausible(observed_score, history,
+                                                        threshold):
+        return None
+    client = client or get_default_client()
+    suser = prompts.build_sanity_user(code_diff or "(no diff)",
+                                      hypothesis or {}, observed_score,
+                                      history, threshold or ORACLE_PRIMARY_CEILING)
+    sraw = client.complete(prompts.SANITY_SYSTEM, suser, kind=KIND_SANITY,
+                           max_tokens=800, temperature=0.0)
+    try:
+        return json.loads(sraw)
+    except Exception:                              # noqa: BLE001
+        # Unparseable means "no opinion", and a leak check with no opinion must
+        # not read as approval.
+        return {"implements_hypothesis": False, "leak_suspected": True,
+                "reasoning": "sanity model returned unparseable output; "
+                             "blocking as a precaution.",
+                "raw": sraw[:500]}

@@ -190,7 +190,7 @@ class _StubLLM:
                 "contradictory_findings": [], "dataset_compatibility": [],
                 "implementation_cost": "small", "primary_citation": "x"}
 
-    def generate_hypothesis(self, diagnosis, evidence_card, tried=None):
+    def generate_hypothesis(self, diagnosis, evidence_card, tried=None, **kw):
         return [{"mechanism": f"mech targeting {diagnosis['component']}",
                  "success_criterion_paired":
                      "primary on val-tier-1 improves by at least +0.001 "
@@ -199,8 +199,22 @@ class _StubLLM:
 
 
 class _NullMemory:
+    """An evidence store that has never recorded anything.
+
+    Implements the whole surface `_build_improve_candidates` consumes, so these
+    tests exercise the exhausted-COMPONENT path with the mechanism-FAMILY path
+    held at "nothing is blocked" — the two constraints are independent and this
+    module is about the first one.
+    """
+
     def is_duplicate(self, fp, blocking_only=False):
         return None
+
+    def is_blocked(self, fp):
+        return False
+
+    def probationary_families(self):
+        return []
 
 
 def _build(llm, ledger):
@@ -307,7 +321,7 @@ def test_a_monopolising_component_is_retired_during_a_real_run(
     BASE = 0.6012
 
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         # Baseline for the root and for confirm; every candidate lands a hair
         # below it, so each scored attempt is real evidence against the
         # component rather than a failure to implement it.

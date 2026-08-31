@@ -34,40 +34,71 @@ def ground_in_literature(bottleneck):
             "implementation_cost": "small",
             "primary_citation": "Rendle et al. 2009 BPR"}
 
-def generate_hypothesis(diagnosis, evidence_card, tried=None):
-    """One hypothesis, varying with the diagnosis it was given.
+#: Families the mock rotates through, so successive iterations produce DISTINCT
+#: fingerprints the way a real proposer does — and so a batch of more than one is
+#: family-diverse, which the schema now requires.
+#: How many hypotheses the mock returns per call. Matches
+#: llm_calls.hypothesis.HYPOTHESES_MIN so a mocked run exercises the same
+#: proposal width production does, and so the driver's execution cap
+#: (MAX_CANDIDATES_PER_ITER = 4) is actually reached rather than never tested.
+MOCK_BATCH_SIZE = 6
 
-    `tried` is accepted and folded into the variant tag rather than ignored.
-    Ignoring it would let the mock diverge from the real signature, and it is
-    also the only way a mocked run can exercise the ledger path at all: the
-    driver now passes an attempt ledger on every improve iteration, so a mock
-    that dropped it would silently mask a TypeError in production.
+_MOCK_FAMILIES = ("bpr_pairwise", "sequence_features", "multitask_auxiliary",
+                  "listwise_softmax", "negative_sampling", "watchtime_censored",
+                  "capacity_or_regularization", "static_feature_domains",
+                  "ensemble_blend", "gbdt_swap", "generic_pairwise",
+                  "lambdarank_surrogate", "ranknet_pairwise")
 
-    The variation is load-bearing, not cosmetic. This used to return a single
-    frozen mechanism, so every iteration produced the same _fingerprint, and
-    memory dedup killed iteration 2 onward with zero candidates — which closed
-    the parent, emptied open_nodes, and stopped a `--mock --max-iters 8` run at
-    iteration 3. Nothing past iteration 3 (the refine cadence, the ε/N plateau
-    signal) could be exercised against the mocks at all.
 
-    Derived from the diagnosis rather than a call counter, so a mocked run is
-    reproducible regardless of which tests ran first. diagnose() folds a digest
-    of its whole node context into `evidence`, and that context now carries
-    iter_history — so the tag advances once per iteration.
+def generate_hypothesis(diagnosis, evidence_card, tried=None,
+                        blocked_families=None):
+    """Hypotheses in EXACTLY the shape production emits — schema keys only.
+
+    This mock used to supply `loss_type` / `sampler` / `feature_set` /
+    `dataset_tier`, with a per-iteration digest folded into loss_type. Those four
+    keys are forbidden on a real hypothesis by
+    `llm_calls/schemas.py::_reject_unknown_keys`, so the mock took
+    `_fingerprint`'s STRUCTURED branch while production always took the family
+    branch. Its fingerprints were therefore unique forever, and the family
+    collision that killed the recorded run at iteration 4 was unreachable in
+    every test in the repo. Emitting schema-shaped output is what makes the
+    end-to-end test exercise the path production actually uses.
+
+    `blocked_families` is respected rather than ignored: the mock picks a family
+    that is not blocked. A mock that proposed into a ban would make every mocked
+    run exercise the starvation path and nothing else.
+
+    The per-iteration VARIATION is still load-bearing. A single frozen mechanism
+    produced the same fingerprint every iteration, memory dedup killed iteration
+    2 onward with zero candidates, and a `--mock --max-iters 8` run stopped at
+    iteration 3. Derived from the diagnosis rather than a call counter, so a
+    mocked run is reproducible regardless of which tests ran first.
     """
     tag = hashlib.sha1(
         f"{diagnosis.get('bottleneck', '')}|{diagnosis.get('evidence', '')}"
         f"|{len(tried or [])}"
         .encode("utf-8")).hexdigest()[:8]
+    legal = [f for f in _MOCK_FAMILIES if f not in set(blocked_families or ())]
+    if not legal:
+        legal = ["other"]
+    # A BATCH spanning distinct families, matching what llm_calls.hypothesis
+    # asks for since T2.7 (`_decide_count` returns 6-8, never 1). A mock that
+    # returned one hypothesis left the widened-proposal path — and the driver's
+    # dedup / feasibility / diversity filter and its execution cap — unexercised
+    # by every `--mock` run.
+    n = min(MOCK_BATCH_SIZE, len(legal))
+    start = int(tag, 16) % len(legal)          # rotates per iteration
+    picked = [legal[(start + i) % len(legal)] for i in range(n)]
     return [{
-        "mechanism": ("swap pointwise logloss for BPR pairs sampled within "
-                      f"user_id (variant {tag})"),
+        "mechanism": (f"attack {family} (variant {tag}): swap pointwise logloss "
+                      f"for a within-user ranking objective"),
         "success_criterion_paired": "candidate primary − parent primary > 0.005 on valid_search",
-        "implementation_sketch": "in baseline.py FM.step, form (pos, neg) pairs per user",
-        # extras the orchestrator uses for dedup fingerprinting
-        "loss_type": f"bpr_{tag}", "sampler": "within_user_neg",
-        "feature_set": "5field_baseline", "dataset_tier": "pure",
-    }]
+        # Names a numpy operation, so the driver's feasibility check passes —
+        # the mock must not be rejected for the reason real bad proposals are.
+        "implementation_sketch": ("in baseline.py FM.step, form (pos, neg) pairs "
+                                  "per user with np.add.at over the index arrays"),
+        "mechanism_family": family,
+    } for family in picked]
 
 def refine(component, component_source, ablations, iter_history,
            improvement_score, prior_refines=None):

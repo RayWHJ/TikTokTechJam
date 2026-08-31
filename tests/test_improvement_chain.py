@@ -43,7 +43,20 @@ def _baseline_per_user(seed):
     return {u: BASE_PRIMARY + rng.gauss(0, 0.02) for u in USERS}
 
 
-def _metrics(per_user):
+#: What a CLEAN candidate scores under the T3.4 label-permutation control.
+#: Measured on the real baseline: primary 0.4840, GAUC 0.4998 against a
+#: theoretical 0.5. A stub that returned its normal score here would be claiming
+#: its score survives label shuffling — the leak signature — and the driver would
+#: correctly refuse the promotion.
+PERMUTED_PRIMARY = 0.4840
+
+
+def _metrics(per_user, permuted=False):
+    if permuted:
+        return {"status": "ok", "logs": "",
+                "metrics": {"primary": PERMUTED_PRIMARY, "GAUC": 0.4998,
+                            "nDCG@5": 0.4682,
+                            "per_user": {u: PERMUTED_PRIMARY for u in per_user}}}
     primary = sum(per_user.values()) / len(per_user)
     return {"status": "ok", "logs": "",
             "metrics": {"primary": primary, "GAUC": primary + 0.03,
@@ -95,11 +108,11 @@ def test_a_known_good_candidate_promotes_and_lifts_global_best(monkeypatch,
     iter_primary — which is exactly what 50 iterations did.
     """
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         per_user = _baseline_per_user(seed)
         if _is_candidate(code_path):
             per_user = {u: v + KNOWN_LIFT for u, v in per_user.items()}
-        return _metrics(per_user)
+        return _metrics(per_user, permuted=kw.get("permute_labels", False))
 
     _install(monkeypatch, tmp_path, execute)
     result, progress = _run(tmp_path)
@@ -138,12 +151,12 @@ def test_promotion_pairs_against_the_same_split_it_scores(monkeypatch, tmp_path)
     a cross-split subtraction cannot.
     """
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         offset = -0.05 if split == "valid_confirm" else 0.0
         per_user = {u: v + offset for u, v in _baseline_per_user(seed).items()}
         if _is_candidate(code_path):
             per_user = {u: v + KNOWN_LIFT for u, v in per_user.items()}
-        return _metrics(per_user)
+        return _metrics(per_user, permuted=kw.get("permute_labels", False))
 
     _install(monkeypatch, tmp_path, execute)
     result, progress = _run(tmp_path)
@@ -165,7 +178,7 @@ def test_a_flat_candidate_does_not_promote(monkeypatch, tmp_path):
     Guards against having loosened the gates into rubber-stamping noise.
     """
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         rng = random.Random(f"{code_path}|{seed}")
         return _metrics({u: v + rng.gauss(0, 0.02)
                          for u, v in _baseline_per_user(seed).items()})
@@ -201,7 +214,7 @@ def test_node_score_is_the_mean_over_seeds_not_the_max():
 
 def test_measure_root_stores_per_seed_and_uses_the_mean(monkeypatch, tmp_path):
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         return _metrics(_baseline_per_user(seed))
 
     monkeypatch.setattr(driver, "codegen", mock_codegen)
@@ -238,11 +251,11 @@ def test_should_promote_globally_margin_matches_achievable_deltas():
 def test_progress_file_reports_paired_stats_per_candidate(monkeypatch, tmp_path):
     """A flat absolute score is not enough to tell a win from noise."""
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         per_user = _baseline_per_user(seed)
         if _is_candidate(code_path):
             per_user = {u: v + KNOWN_LIFT for u, v in per_user.items()}
-        return _metrics(per_user)
+        return _metrics(per_user, permuted=kw.get("permute_labels", False))
 
     _install(monkeypatch, tmp_path, execute)
     _, progress = _run(tmp_path)
@@ -287,7 +300,7 @@ def test_a_no_op_candidate_is_named_not_recorded_as_refuted(monkeypatch, tmp_pat
     against mechanisms that were never actually tried.
     """
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         return _metrics(_baseline_per_user(seed))   # candidate == parent, always
 
     _install(monkeypatch, tmp_path, execute)

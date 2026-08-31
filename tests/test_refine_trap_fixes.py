@@ -155,7 +155,7 @@ def _install(monkeypatch, tmp_path, script, *, ablated=BASE - 0.01):
                 "edit_radius": "small", "expected_cost": "medium",
                 "incompatibilities": [], "uncertainty": 0.25}
 
-    def generate_hypothesis(diagnosis, evidence_card, tried=None):
+    def generate_hypothesis(diagnosis, evidence_card, tried=None, **kw):
         return [{"mechanism": f"scripted mechanism for iter {script.it}",
                  "success_criterion_paired": "> 0.005 on valid_search",
                  "implementation_sketch": f"sketch {script.it}",
@@ -168,7 +168,7 @@ def _install(monkeypatch, tmp_path, script, *, ablated=BASE - 0.01):
         return real_refine(*a, **kw)
 
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         # `ablated` is a knob: BASE - 0.01 puts every ablation delta above the
         # noise floor (refine allowed), BASE puts them all at zero (suppressed).
         if "candidate_ablation_" in str(code_path):

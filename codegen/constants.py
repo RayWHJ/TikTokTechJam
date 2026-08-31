@@ -27,6 +27,19 @@ AUXILIARY_SIGNALS = [
     "is_click", "is_like", "is_follow", "is_comment", "is_forward", "play_time_ms",
 ]
 
+# THE LABEL. Not in AUXILIARY_SIGNALS, and that omission was the gate's blind
+# spot: `long_view` is the target the metric is computed from, so a feature
+# derived from it is the most direct leak available — and `prev_long_view`, the
+# one genuinely risky construction in the recorded run, passed the deterministic
+# gate cleanly because nothing here named the label.
+#
+# Treated like NON_CAUSAL_COLUMNS rather than like AUXILIARY_SIGNALS: a LAGGED
+# use is legitimate and is a direction the prompts actively recommend
+# (`data.prev_value_within_user(rows, key=6)`), so the rule demands an explicit
+# `point_in_time=True` marker rather than forbidding the name outright. The
+# marker is what makes the author state that they thought about the shift.
+LABEL_COLUMNS = ["long_view", "LABEL"]
+
 # Oracle ceiling for the primary metric on this dataset (from the starter kit
 # README): a validation/test primary above this is physically impossible and is
 # strong evidence of a leak.

@@ -8,7 +8,7 @@ training loop." The relevant existing file's content is passed to the model as
 context, together with hypothesis['mechanism'] and hypothesis['implementation_sketch'].
 """
 from __future__ import annotations
-import ast, difflib, os, re, shutil, subprocess, tempfile
+import ast, difflib, os, re, shutil, subprocess, tempfile, textwrap
 
 from .diffnorm import normalize_unified_diff
 
@@ -60,9 +60,20 @@ _APPLY_CHECKS = (
 #: Rewrites shorter than this fraction of the original are treated as truncated.
 _MIN_REWRITE_RATIO = 0.6
 #: Elision markers that mean the model summarised instead of reproducing code.
+#:
+#: The `\b` applies only to the WORD alternatives. It used to sit after the whole
+#: inner alternation, which made `# ...` unmatchable: `...` ends in a non-word
+#: character, so `\b` could never be satisfied against the space or line end that
+#: follows. Measured before the fix — `# ...` and `# ... rest of function
+#: unchanged` both passed the guard, while `# rest of file` and `# unchanged`
+#: were caught. `# ...` is the most natural form a model produces, and rule 7 of
+#: the writer prompt names it explicitly, so the guard was missing its main case.
+#:
+#: `[ \t]*` rather than `\s*` at the start so a match cannot begin by consuming
+#: the previous line's newline.
 _ELISION_RE = re.compile(
-    r"^\s*(?:\.\.\.|#\s*(?:\.\.\.|rest of|remainder|unchanged|as before|"
-    r"same as|omitted|truncated)\b)", re.IGNORECASE | re.MULTILINE)
+    r"^[ \t]*(?:\.\.\.|#\s*(?:\.\.\.|(?:rest of|remainder|unchanged|as before|"
+    r"same as|omitted|truncated)\b))", re.IGNORECASE | re.MULTILINE)
 
 
 def _extract_python(text: str) -> str | None:
@@ -75,6 +86,17 @@ def _extract_python(text: str) -> str | None:
 NO_SEMANTIC_CHANGE = ("the rewrite changed only comments, docstrings or "
                       "formatting — the executable code is byte-identical, so "
                       "this candidate would score exactly the same as its parent")
+
+#: How many of `write_fix`'s attempts use the function-SCOPED contract before
+#: falling back to the whole-file rewrite.
+#:
+#: One. The scoped form is strictly better when it works, but the cases it cannot
+#: express — a new module-level constant, an edit to the FIELDS list literal —
+#: are common enough here that burning two of three attempts on it would be worse
+#: than trying it once and moving on. Set to 0 to disable scoped edits entirely;
+#: `write_fix` also skips them when max_attempts leaves no room for a fallback,
+#: so a caller asking for a single attempt still gets the whole-file path.
+SCOPED_ATTEMPTS = 1
 
 
 #: AST nodes whose leading string literal is a docstring, not a statement.
@@ -115,6 +137,229 @@ def changes_executable_code(original: str, rewritten: str) -> bool:
     except SyntaxError:
         return True
     return ast.dump(old_tree) != ast.dump(new_tree)
+
+
+# --------------------------------------------------------------------------- #
+#  Function-scoped edits (T3.1)                                                #
+# --------------------------------------------------------------------------- #
+# WHY. The whole-file rewrite removed every patch-FORMAT failure mode, but it
+# replaced them with a reproduction problem: the model has to re-emit ~500 lines
+# correctly to change five. Three consequences, all visible in this repo:
+#
+#   * `codegen/gate.py::_removed_lines` needs an exemption for lines that "merely
+#     moved", and the RNG rule has to distinguish a new draw from a shifted hunk —
+#     both are artefacts of a diff that touches the whole file.
+#   * the run-wide diff-hash dedup weakens, because an unrelated formatting change
+#     makes a semantically identical edit hash differently.
+#   * it is the dominant token cost after the model swap — ~4,300 output tokens
+#     per writer call at $20 per Mtok.
+#
+# So ask for only the definitions being changed, locate them by AST, and splice
+# them into the original text. The whole-file path stays as the fallback for when
+# a definition cannot be located, and both paths run the same elision and
+# no-op guards afterwards.
+#
+# Line-based splicing, deliberately, NOT ast.unparse: unparsing would reformat
+# and re-emit the entire file, producing exactly the huge diff this task exists to
+# avoid, and would discard every comment in it.
+
+#: A located definition in a source file: the line span it occupies (1-based,
+#: inclusive) and the indentation its body sits at.
+class _Span:
+    __slots__ = ("start", "end", "indent")
+
+    def __init__(self, start: int, end: int, indent: str):
+        self.start, self.end, self.indent = start, end, indent
+
+
+def _def_start(node) -> int:
+    """First line of a definition, decorators included.
+
+    `node.lineno` points at the `def`, so splicing from there would leave the old
+    decorators attached to the new function.
+    """
+    lines = [node.lineno]
+    lines += [d.lineno for d in getattr(node, "decorator_list", [])]
+    return min(lines)
+
+
+_DEF_TYPES = (ast.FunctionDef, ast.AsyncFunctionDef)
+
+
+def _index_definitions(source: str) -> dict:
+    """Map every top-level function and method to its line span.
+
+    Keys are `"name"` for a module-level function and `"Class.name"` for a
+    method, which is the vocabulary the writer prompt uses ("FM.step").
+    """
+    try:
+        tree = ast.parse(source)
+    except SyntaxError:
+        return {}
+    src_lines = source.splitlines()
+    out: dict = {}
+
+    def _indent_of(lineno: int) -> str:
+        line = src_lines[lineno - 1] if 0 < lineno <= len(src_lines) else ""
+        return line[:len(line) - len(line.lstrip())]
+
+    for node in tree.body:
+        if isinstance(node, _DEF_TYPES):
+            s = _def_start(node)
+            out[node.name] = _Span(s, node.end_lineno, _indent_of(s))
+        elif isinstance(node, ast.ClassDef):
+            cls_span = _Span(_def_start(node), node.end_lineno,
+                             _indent_of(_def_start(node)))
+            out[f"class {node.name}"] = cls_span
+            for sub in node.body:
+                if isinstance(sub, _DEF_TYPES):
+                    s = _def_start(sub)
+                    out[f"{node.name}.{sub.name}"] = _Span(
+                        s, sub.end_lineno, _indent_of(s))
+    return out
+
+
+def _parse_replacements(block: str) -> tuple[dict, str]:
+    """Definitions the model's block provides, keyed as `_index_definitions` is.
+
+    Accepts a bare function, several functions, or a `class X:` wrapper holding
+    methods. A class wrapper contributes its METHODS rather than the class itself:
+    a model asked for one method commonly re-emits the class header around it and
+    omits the other methods, and replacing the whole class would silently delete
+    them.
+
+    Returns ({key: source_text}, error).
+    """
+    block = textwrap.dedent(block).strip("\n")
+    if not block.strip():
+        return {}, "empty replacement block"
+    try:
+        tree = ast.parse(block)
+    except SyntaxError as e:
+        return {}, f"replacement block is not valid Python: {e}"
+
+    lines = block.splitlines()
+
+    def _segment(node) -> str:
+        return "\n".join(lines[_def_start(node) - 1:node.end_lineno])
+
+    out: dict = {}
+    for node in tree.body:
+        if isinstance(node, _DEF_TYPES):
+            out[node.name] = _segment(node)
+        elif isinstance(node, ast.ClassDef):
+            methods = [s for s in node.body if isinstance(s, _DEF_TYPES)]
+            if not methods:
+                return {}, (f"class {node.name} in the replacement block has no "
+                            f"methods to splice")
+            for sub in methods:
+                out[f"{node.name}.{sub.name}"] = textwrap.dedent(_segment(sub))
+        elif isinstance(node, (ast.Import, ast.ImportFrom)):
+            out.setdefault("__imports__", "")
+            out["__imports__"] += _segment(node) + "\n"
+        else:
+            return {}, (
+                f"the replacement block contains a top-level "
+                f"{type(node).__name__} statement. Return ONLY the complete "
+                f"function or method definitions you are changing (plus any new "
+                f"import), not module-level code — module-level changes need the "
+                f"whole-file form.")
+    if not any(k != "__imports__" for k in out):
+        return {}, "the replacement block defines no function or method"
+    return out, ""
+
+
+def splice_definitions(original: str, block: str) -> tuple[str, str]:
+    """Replace the named definitions in `original` with those in `block`.
+
+    Returns (new_source, error). A definition present in `block` but ABSENT from
+    `original` is inserted immediately before the first definition being
+    replaced, so "edit FM.step and add FM.bpr_step" is one splice rather than a
+    fallback to the whole file.
+
+    Fails (so the caller falls back) when no definition in `block` matches
+    anything in `original` — that means the model did not scope its answer to
+    something locatable, and guessing where to put it is how a splice corrupts a
+    file.
+    """
+    replacements, err = _parse_replacements(block)
+    if err:
+        return "", err
+    imports = replacements.pop("__imports__", "")
+
+    index = _index_definitions(original)
+    if not index:
+        return "", "could not parse the original file to locate definitions"
+
+    known = {k: v for k, v in replacements.items() if k in index}
+    unknown = {k: v for k, v in replacements.items() if k not in index}
+    if not known:
+        return "", (f"none of {sorted(replacements)} exists in the file "
+                    f"(top-level definitions are {sorted(k for k in index if not k.startswith('class '))}); "
+                    f"cannot splice")
+
+    lines = original.splitlines()
+    # Apply spans BOTTOM-UP so earlier line numbers stay valid as we edit.
+    edits = sorted(((index[k], text, k) for k, text in known.items()),
+                   key=lambda t: t[0].start, reverse=True)
+    # Captured BEFORE editing: where new definitions go, and at what indentation.
+    # A method's new sibling belongs inside the class, at the class body's indent,
+    # which is the indent of the definition it sits next to.
+    first = min((sp for sp, _t, _k in edits), key=lambda sp: sp.start)
+    insert_at, insert_indent = first.start, first.indent
+
+    for span, text, _key in edits:
+        body = textwrap.indent(textwrap.dedent(text).strip("\n"), span.indent)
+        lines[span.start - 1:span.end] = body.splitlines()
+
+    if unknown:
+        block_lines: list = []
+        for _key, text in unknown.items():
+            block_lines += textwrap.indent(
+                textwrap.dedent(text).strip("\n"), insert_indent).splitlines()
+            block_lines.append("")
+        lines[insert_at - 1:insert_at - 1] = block_lines
+
+    if imports.strip():
+        # After the module docstring and any existing imports, which is the only
+        # placement that cannot shadow a name the file already binds.
+        lines[0:0] = [l for l in imports.strip().splitlines()]
+
+    new_source = "\n".join(lines)
+    if not new_source.endswith("\n"):
+        new_source += "\n"
+    try:
+        ast.parse(new_source)
+    except SyntaxError as e:
+        return "", f"the spliced file does not parse: {e}"
+    return new_source, ""
+
+
+def splice_to_diff(block: str, original: str, file_name: str
+                   ) -> tuple[str, str]:
+    """Turn a function-scoped replacement into a unified diff. (diff, error).
+
+    Runs the SAME guards the whole-file path runs — elision on the block, and
+    `changes_executable_code` on the resulting file — because both failure modes
+    are still reachable here: a model can elide the middle of a long function, and
+    it can return the function with only its docstring changed.
+    """
+    if not block.strip():
+        return "", "empty replacement block"
+    if _ELISION_RE.search(block):
+        return "", ("the replacement was elided (`...` / `# rest of function`) "
+                    "instead of reproduced in full")
+    new_source, err = splice_definitions(original, block)
+    if err:
+        return "", err
+    if not changes_executable_code(original, new_source):
+        return "", NO_SEMANTIC_CHANGE
+    diff = "".join(difflib.unified_diff(
+        original.splitlines(keepends=True), new_source.splitlines(keepends=True),
+        f"a/{file_name}", f"b/{file_name}", n=3))
+    if not diff.strip():
+        return "", "the splice produced no change"
+    return diff, ""
 
 
 def rewrite_to_diff(rewritten: str, original: str, file_name: str) -> tuple[str, str]:
@@ -222,18 +467,44 @@ def write_fix(hypothesis: dict, target_component: str, *,
     if semantic_feedback:
         user += prompts.build_semantic_repair_suffix(file_name, semantic_feedback)
 
-    # Validate-and-repair. The prompt asks for a full-file rewrite, which we diff
-    # locally; the retry is only worth spending because the message changes (the
-    # client runs at temperature 0) and carries the concrete rejection reason.
+    # Validate-and-repair, over TWO output contracts.
+    #
+    # Attempt 1 asks for only the definitions being changed and splices them in
+    # (T3.1): a ~40-line answer instead of a ~500-line one, so there are ~460
+    # fewer lines the model can get wrong, the diff stops touching the whole file,
+    # and the output token cost drops by roughly an order of magnitude.
+    #
+    # Later attempts fall back to the whole-file rewrite. That is not a
+    # concession — a change to module-level code (a new constant, an edit to the
+    # FIELDS list literal) genuinely cannot be expressed as a definition splice,
+    # and `splice_definitions` refuses to guess. The fallback is REACHED by the
+    # same error-feedback mechanism as any other rejection, so it costs no extra
+    # call: max_attempts is unchanged.
     diff, err = "", ""
-    for attempt in range(1, max(1, max_attempts) + 1):
-        msg = user if attempt == 1 else \
-            user + prompts.build_diff_repair_suffix(file_name, err)
+    total = max(1, max_attempts)
+    for attempt in range(1, total + 1):
+        scoped = attempt <= SCOPED_ATTEMPTS and total > SCOPED_ATTEMPTS
+        msg = user
+        if scoped:
+            msg += prompts.build_scoped_suffix(file_name)
+        if attempt > 1:
+            msg += prompts.build_diff_repair_suffix(file_name, err)
         raw = client.complete(system, msg, kind=KIND_DIFF,
                               max_tokens=16000, temperature=0.0)
 
         block = _extract_python(raw)
-        if block is not None and not block.lstrip().startswith(("--- ", "diff --git")):
+        if scoped:
+            if block is None:
+                # No code block at all: the model said it needs module-level
+                # changes (which the scoped suffix invites it to say in prose),
+                # or it ignored the format. Either way the next attempt is
+                # whole-file, which is what it needs.
+                diff, err = "", (
+                    "no ```python block in the scoped reply: "
+                    f"{raw.strip()[:300]!r}")
+            else:
+                diff, err = splice_to_diff(block, content, file_name)
+        elif block is not None and not block.lstrip().startswith(("--- ", "diff --git")):
             diff, err = rewrite_to_diff(block, content, file_name)
         else:
             # The model returned a patch anyway. Take it, but repair the hunk

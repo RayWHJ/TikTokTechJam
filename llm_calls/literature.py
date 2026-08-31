@@ -4,7 +4,9 @@ import json
 import os
 from typing import Dict, Optional
 
-from .client import DEFAULT_MODEL, call_model_with_search
+from .client import call_model_with_search
+from .routing import effort_for, model_for
+from .usage import KIND_LITERATURE
 from .personas import LITERATURE_SYSTEM_PROMPT
 from .retry import call_with_schema_retry
 from .schemas import validate_literature
@@ -68,7 +70,10 @@ def ground_in_literature(bottleneck: str) -> Dict:
     prompt = _build_prompt(bottleneck)
 
     def call_fn(p: str) -> str:
-        return call_model_with_search(LITERATURE_SYSTEM_PROMPT, p, model=DEFAULT_MODEL)
+        return call_model_with_search(LITERATURE_SYSTEM_PROMPT, p,
+                                      model=model_for(KIND_LITERATURE),
+                                      effort=effort_for(KIND_LITERATURE),
+                                      kind=KIND_LITERATURE)
 
     result = call_with_schema_retry(call_fn, prompt, validate_literature)
 

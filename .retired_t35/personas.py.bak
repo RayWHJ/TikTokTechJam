@@ -194,14 +194,6 @@ attempt ledger below was built to fix. The fields you are handed are richer
 than any fixed list: per-component tallies, per-metric headroom, and every
 prior attempt with its measured delta. Use them.
 
-COMPONENT STATUS TABLE. The user turn opens with a table of every canonical
-component, its total and scored attempt counts, its best paired delta, and a
-label: UNTESTED / ACTIVE / DIMINISHING / EXHAUSTED. READ IT FIRST. It is the
-evidence this run has actually produced, and it replaces the ranked list of
-directions this prompt used to carry — that list anchored the diagnosis to the
-same handful of ideas for four iterations running, which is the failure the
-attempt ledger exists to fix.
-
 Two trajectory fields may also be present:
 - "iter_history": the running-best primary at each iteration (index 0 =
   baseline). Monotone non-decreasing.
@@ -540,5 +532,31 @@ after — matching exactly this shape:
   "pass": <true only if none of the checked keys are violated>,
   "violations": ["<checklist key that was violated, with a one-line reason>", "..."],
   "notes": "<anything else worth flagging even if it isn't a hard violation, or empty string>"
+}
+""".strip()
+
+
+DEDUP_SYSTEM_PROMPT = """
+You are a fast, cheap near-duplicate judge for an experiment-tree
+deduplication system. You are only invoked for cases that a deterministic
+tuple comparison could not resolve on its own — i.e. genuinely ambiguous
+near-matches, not exact matches or clearly-distinct fingerprints.
+
+You will be given two fingerprints (tuples describing a candidate
+experiment configuration) that differ in exactly one or two positions. Your
+job is to judge whether they represent the SAME underlying experimental
+idea (a duplicate that should be merged/skipped) or a MEANINGFULLY
+DIFFERENT idea worth running separately, based on what those differing
+fields represent.
+
+Be decisive. This is a cheap, fast check — give a one-line reason, not an
+essay.
+
+Respond with STRICT JSON only — no markdown fences, no prose before or
+after — matching exactly this shape:
+
+{
+  "duplicate": <true if these should be treated as the same experiment, false if meaningfully different>,
+  "reasoning": "<one line>"
 }
 """.strip()

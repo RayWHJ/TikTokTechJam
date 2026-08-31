@@ -7,7 +7,9 @@ and we don't waste a round-trip. The rules are stated as constraints, not as the
 scanner's internals.
 """
 from __future__ import annotations
+
 import json
+import textwrap
 
 # The rules the pre-execution gate enforces, in plain language for the model.
 _SAFETY_RULES = """\
@@ -103,13 +105,56 @@ are only useful through an interaction with an item-side value. A LAG feature
 a long_view) is NOT user-constant — it varies row to row inside one user — which
 is precisely why it can move this metric where a user-side aggregate cannot.
 
-Adding a fixed-width categorical field is a legal, self-contained change: append
-the name to FIELDS and return one more value from encode()'s inner raw(x).
-encode() returns X as int32 (N, len(FIELDS)) and the FM indexes X, so it picks
-up the new embedding with no change to baseline.py. Two rules for a lag feature:
-compute it WITHIN each split using only rows at or before the current row (never
-reaching forward, never across the split boundary), and leave the vocabulary
-train-only so an unseen value lands in that field's UNK slot.
+Adding a fixed-width categorical field is a legal, self-contained change, and
+data.py has a REGISTRY for exactly it. Append one entry to EXTRA_FIELDS:
+
+    EXTRA_FIELDS.append(('prev_video_id', prev_video_within_user))
+
+where the function takes that split's `rows` and returns one value per row, in
+row order. That single append is the WHOLE edit: encode() derives X's width, the
+vocabularies, the UNK slots, field_dims and offsets from it, FIELDS follows, and
+the FM picks up the new embedding because it indexes X. encode() returns X as
+int32 (N, len(FIELDS)).
+
+DO NOT append to FIELDS and return one more value from encode()'s inner raw(x).
+raw(x) covers the five BASE_FIELDS and only those; returning an extra value from
+it writes past X's last column, and that is the single most common way a
+candidate has failed here — two candidates died with the identical IndexError
+inside `for i, v in enumerate(raw(x))`. Use EXTRA_FIELDS and there is nothing to
+keep in sync.
+
+The registry function is handed ONE SPLIT's rows at a time, which is what makes
+the two rules for a lag feature easy to satisfy. First: compute it using only
+rows at or before the current row — never reaching forward, and never across the
+split boundary. Second: leave the vocabulary train-only so an unseen value lands
+in that field's UNK slot; encode() does the train-only part for you. The function
+is also called once per split rather than once per row, so write it as a single
+pass and never as a per-row Python callback over 1.4M rows.
+
+DO NOT AUTHOR YOUR OWN VERSION OF THESE. data.py already has them, they are
+tested for causality and split-locality, and re-implementing one is how a
+candidate times out at 240s or leaks a label:
+
+  data.prev_value_within_user(rows, key=2)   -> the user's previous video_id
+  data.prev_value_within_user(rows, key=3)   -> previous author_id
+  data.prev_value_within_user(rows, key=6)   -> whether the previous impression
+                                                was a long_view
+  data.prior_count_within_user(rows, key=3)  -> how many times this user has
+                                                already seen this author,
+                                                bucketed
+  data.position_within_user(rows)            -> position in the user's log,
+                                                bucketed
+  data.within_user_pairs(users, y, rng)      -> vectorised (pos, neg) index
+                                                pairs for a pairwise loss
+
+So the whole edit for a lag field is one line:
+
+    EXTRA_FIELDS.append(('prev_author_id',
+                         lambda rows: prev_value_within_user(rows, key=3)))
+
+`within_user_pairs` takes its generator as an ARGUMENT — call it with
+np.random.default_rng(seed + 1000) and never with run_fm's `rng`, for the reason
+given in the RNG rule below.
 {_RUNTIME_RULES}
 {_SAFETY_RULES}
 {_DIFF_FORMAT_RULES}"""
@@ -167,6 +212,47 @@ Current {file_name} content:
 
 Return the COMPLETE updated {file_name} in one ```python block, implementing the
 mechanism above. Reproduce all untouched lines verbatim and elide nothing."""
+
+
+def build_scoped_suffix(file_name: str) -> str:
+    """Override the whole-file output contract with a function-scoped one.
+
+    Appended to the writer message rather than baked into the system prompt so
+    the SAME system prompt serves both paths — the fallback needs the whole-file
+    rules intact, and maintaining two copies of them is how they drift.
+
+    The instruction here is the opposite of _DIFF_FORMAT_RULES rules 5-6, so it
+    says so explicitly. A model handed two contradictory format rules with no
+    precedence picks one at random.
+    """
+    return f"""
+
+OUTPUT FORMAT — THIS OVERRIDES rules 5 and 6 above. Do NOT return the whole
+file. Return ONLY the complete definitions you are changing, inside one
+```python fenced block:
+
+- One or more complete `def` blocks, reproduced in FULL from `def` to the last
+  line of the body. Include decorators if the original has them.
+- To change a METHOD, wrap it in its class so the target is unambiguous:
+
+    class FM:
+        def step(self, X, y):
+            ...the complete new body...
+
+  Only the methods you include are replaced; the class's other methods are left
+  exactly as they are, so you must not reproduce them.
+- A definition you include that does NOT already exist in {file_name} is treated
+  as new and inserted next to the one you are replacing. So "edit FM.step and add
+  FM.bpr_step" is one block containing both.
+- A new `import` line at the top of the block is allowed.
+- NOTHING ELSE. No module-level statements, no assignments outside a def, no
+  prose. If your change genuinely needs module-level code — a new constant, an
+  edit to a list literal like FIELDS — say exactly that in one line instead of a
+  code block, and you will be re-asked for the whole file.
+- Rules 7 and 8 still apply: never elide, and keep the change minimal.
+
+The caller locates your definitions by name and splices them in, so you do not
+reproduce {file_name}'s other ~400 lines and cannot introduce an error in them."""
 
 
 def build_diff_repair_suffix(file_name: str, apply_error: str) -> str:
@@ -250,9 +336,52 @@ def build_ancestor_block(ancestors: list | None) -> str:
     return "\n".join(lines)
 
 
+def build_digest_block(prior_failures: list | None) -> str:
+    """Prior failures elsewhere in the run with the SAME signature (T3.2).
+
+    Distinct from `build_ancestor_block`, which walks the tree upward. The two
+    identical `encode` crashes in the recorded run were SIBLINGS, so no ancestor
+    walk could have shown either one the other's traceback. Keyed on
+    (file, exception, line) instead, because that is how the failures cluster.
+
+    Empty when the signature is new, which keeps the prompt unchanged in the
+    common case.
+    """
+    if not prior_failures:
+        return ""
+    lines = ["", "SEEN BEFORE IN THIS RUN — the same file, exception and line "
+                 "have already failed here:"]
+    for e in prior_failures:
+        outcome = ("the repair below FIXED it" if e.get("repaired") is True
+                   else "the repair below did NOT fix it"
+                   if e.get("repaired") is False
+                   else "outcome unknown")
+        lines.append(f"- candidate {e.get('node_id')} "
+                     f"({e.get('stage', 'execute')}), {outcome}")
+        if e.get("mechanism"):
+            lines.append(f"  it was implementing: {e['mechanism']}")
+        if e.get("repair_attempted"):
+            lines.append(f"  repair attempted:\n"
+                         f"{textwrap.indent(e['repair_attempted'], '    ')}")
+    lines += [
+        "",
+        "Read this before repeating a repair that already failed. If a listed "
+        "repair did NOT fix the failure, do something different — the same diff "
+        "will fail the same way. If one DID fix it, the equivalent change here "
+        "is the cheapest correct answer.",
+        "Two candidates failing identically usually means the ORIGINAL file's "
+        "contract was misread, not that both edits were careless: prefer a fix "
+        "that makes the contract hard to get wrong over one that patches the "
+        "symptom.",
+        "",
+    ]
+    return "\n".join(lines)
+
+
 def build_debug_user(file_name: str, file_content: str, error_context: str,
                      hypothesis: dict | None = None,
-                     ancestors: list | None = None) -> str:
+                     ancestors: list | None = None,
+                     prior_failures: list | None = None) -> str:
     """`hypothesis` and `ancestors` are optional so the frozen 3-positional-arg
     form keeps working; codegen/tests and debug_and_retry's 2-argument contract
     both depend on it."""
@@ -275,7 +404,7 @@ The candidate failed. Error / divergence context:
 ```
 {error_context}
 ```
-{intent}{build_ancestor_block(ancestors)}
+{intent}{build_digest_block(prior_failures)}{build_ancestor_block(ancestors)}
 Current {file_name} content:
 ```python
 {file_content}

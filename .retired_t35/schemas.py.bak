@@ -327,6 +327,23 @@ def validate_audit(parsed: Any) -> Dict:
 
 
 # ---------------------------------------------------------------------------
+# dedup_fingerprint_match() escalation
+# ---------------------------------------------------------------------------
+
+_DEDUP_KEYS = ["duplicate", "reasoning"]
+
+
+def validate_dedup(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _DEDUP_KEYS)
+    _reject_unknown_keys(d, _DEDUP_KEYS)
+    return {
+        "duplicate": _check_bool(d, "duplicate"),
+        "reasoning": _check_str(d, "reasoning"),
+    }
+
+
+# ---------------------------------------------------------------------------
 # Enforced JSON schemas (T2.6)
 # ---------------------------------------------------------------------------
 # The gpt-5.6 family supports server-side schema enforcement, so the model

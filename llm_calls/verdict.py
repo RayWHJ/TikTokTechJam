@@ -30,10 +30,12 @@ from __future__ import annotations
 import json
 from typing import Dict
 
-from .client import DEFAULT_MODEL, call_model_text
+from .client import call_model_text
+from .routing import effort_for, model_for
+from .usage import KIND_VERDICT
 from .personas import VERDICT_SYSTEM_PROMPT
 from .retry import call_with_schema_retry
-from .schemas import validate_verdict
+from .schemas import VERDICT_JSON_SCHEMA, validate_verdict
 
 
 def _build_prompt(hypothesis: dict, measured: dict, context: dict) -> str:
@@ -66,6 +68,10 @@ def verdict(hypothesis: dict, measured: dict, context: dict) -> Dict:
     prompt = _build_prompt(hypothesis, measured, context)
 
     def call_fn(p: str) -> str:
-        return call_model_text(VERDICT_SYSTEM_PROMPT, p, model=DEFAULT_MODEL)
+        return call_model_text(VERDICT_SYSTEM_PROMPT, p,
+                               model=model_for(KIND_VERDICT),
+                               effort=effort_for(KIND_VERDICT),
+                               text_format=VERDICT_JSON_SCHEMA,
+                               kind=KIND_VERDICT)
 
     return call_with_schema_retry(call_fn, prompt, validate_verdict)

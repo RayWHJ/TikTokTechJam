@@ -81,7 +81,7 @@ class _StubCodegen:
         return f"diff for {target_component}: {hypothesis['mechanism'][:20]}"
 
     def execute(self, code_path, seed, split, wallclock_cap_seconds,
-                root=None, data_dir=None):
+                root=None, data_dir=None, **kw):
         self.execute_calls += 1
         return {"status": "ok", "logs": "",
                 "metrics": {"primary": self.primary, "per_user": {}}}
@@ -233,7 +233,7 @@ def _install(monkeypatch, tmp_path, script, spy=None):
                 "edit_radius": "small", "expected_cost": "medium",
                 "incompatibilities": [], "uncertainty": 0.25}
 
-    def generate_hypothesis(diagnosis, evidence_card, tried=None):
+    def generate_hypothesis(diagnosis, evidence_card, tried=None, **kw):
         # Iteration index in both loss_type and mechanism: the former keeps
         # _fingerprint unique against memory dedup, the latter keeps the
         # written diff unique against the run-wide diff-hash dedup.
@@ -249,7 +249,7 @@ def _install(monkeypatch, tmp_path, script, spy=None):
         return real_refine(*a, **kw)
 
     def execute(code_path, seed, split, wallclock_cap_seconds, root=None,
-                data_dir=None):
+                data_dir=None, **kw):
         is_candidate = "candidate_" in str(code_path)
         # Ablation runs stage under candidate_ablation_*. They all return the
         # same value, so the weakest pick stays a deterministic alphabetical

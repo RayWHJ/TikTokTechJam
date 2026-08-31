@@ -10,3 +10,4 @@ orchestrator/_state/
 .env
 bundle_code.py
 bundle_code.html
+FIX_PLAN.md

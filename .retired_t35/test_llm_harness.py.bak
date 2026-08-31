@@ -31,6 +31,7 @@ audit_mod = importlib.import_module("llm_calls.audit")
 
 from llm_calls import literature as literature_mod
 from llm_calls import hypothesis as hypothesis_mod
+from llm_calls import dedup as dedup_mod
 from llm_calls.exceptions import LLMSchemaError
 
 
@@ -357,3 +358,58 @@ def test_audit_contradictory_response_triggers_retry(monkeypatch):
     assert result["pass"] is False
 
 
+# ---------------------------------------------------------------------------
+# dedup_fingerprint_match()
+# ---------------------------------------------------------------------------
+
+def _forbid_model_call(system, p, model=None, **kw):
+    raise AssertionError("model should not have been called for this case")
+
+
+def test_dedup_exact_match_no_model_call(monkeypatch):
+    monkeypatch.setattr(dedup_mod, "call_model_text", _forbid_model_call)
+
+    candidate = ("din_attention", "user_history_len_20", "loss=bce")
+    memory = [("din_attention", "user_history_len_20", "loss=bce")]
+
+    assert dedup_mod.dedup_fingerprint_match(candidate, memory) is True
+
+
+def test_dedup_clearly_distinct_no_model_call(monkeypatch):
+    monkeypatch.setattr(dedup_mod, "call_model_text", _forbid_model_call)
+
+    candidate = ("din_attention", "user_history_len_20", "loss=bce")
+    memory = [("esmm_multitask", "shared_bottom", "loss=pairwise")]
+
+    assert dedup_mod.dedup_fingerprint_match(candidate, memory) is False
+
+
+def test_dedup_ambiguous_case_escalates_to_model(monkeypatch):
+    dup_response = json.dumps({"duplicate": True, "reasoning": "same architecture, only a minor hparam differs"})
+    call_fn = _make_sequenced_call_fn([dup_response])
+    monkeypatch.setattr(dedup_mod, "call_model_text",
+                         lambda system, p, model=None, **kw: call_fn(p))
+
+    candidate = ("din_attention", "user_history_len_20", "loss=bce")
+    memory = [("din_attention", "user_history_len_50", "loss=bce")]  # differs in exactly 1 position
+
+    result = dedup_mod.dedup_fingerprint_match(candidate, memory)
+
+    assert call_fn.calls["count"] == 1
+    assert result is True
+
+
+def test_dedup_ambiguous_case_model_says_not_duplicate(monkeypatch):
+    not_dup_response = json.dumps({"duplicate": False, "reasoning": "history length is a meaningfully different design choice"})
+    call_fn = _make_sequenced_call_fn([not_dup_response])
+    monkeypatch.setattr(dedup_mod, "call_model_text",
+                         lambda system, p, model=None, **kw: call_fn(p))
+
+    candidate = ("din_attention", "user_history_len_20", "loss=bce")
+    memory = [("din_attention", "user_history_len_50", "loss=bce")]
+
+    assert dedup_mod.dedup_fingerprint_match(candidate, memory) is False
+
+
+if __name__ == "__main__":
+    pytest.main([__file__, "-v"])

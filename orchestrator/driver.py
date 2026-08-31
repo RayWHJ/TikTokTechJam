@@ -5,6 +5,7 @@ load_dotenv()
 import os
 import json
 import hashlib
+import re
 import time
 import uuid
 import tempfile
@@ -20,6 +21,9 @@ from typing import List
 import harness
 from llm_calls import (diagnose, ground_in_literature, generate_hypothesis,
                        refine, audit, verdict)
+from llm_calls.families import (ALL_FAMILIES as _FAMILY_NAMES,
+                                MECHANISM_FAMILIES, OTHER,
+                                family_from_text, normalise_declaration)
 import codegen
 from codegen.ablations import ABLATIONS
 
@@ -68,6 +72,14 @@ NODES_LOG_PATH = "orchestrator/_state/nodes.jsonl"
 # Measured once per machine and reused: the unmodified baseline's per-user scores,
 # which every candidate is paired against. ~20s per seed, so this is cheap.
 ROOT_BASELINE_PATH = "orchestrator/_state/root_baseline.json"
+
+# The Devpost-style write-up, synthesised from the run log at the end of a run.
+# `codegen.synthesize_report` existed, was tested, and was wired into nothing
+# (T3.5) — so a required deliverable was being produced by hand from a file the
+# search wrote. One model call at the end of a run is the cheapest of the four
+# dead call sites to make real, and it is the only one that produces a
+# deliverable.
+REPORT_PATH = "orchestrator/_state/report.md"
 ROOT_SEEDS = (0, 1, 2)
 
 # The baseline scored on the SEALED valid_confirm split, measured lazily on the
@@ -100,6 +112,39 @@ HILLCLIMB_MIN_P_POSITIVE = 0.5
 # concentrates the remaining iterations on the live ones.
 MAX_OPEN_NODES = 4
 
+# How many candidates may reach _attempt() in one iteration, after dedup, the
+# numpy-feasibility check and family diversity have filtered the batch.
+#
+# The asymmetry this exploits: a hypothesis costs ~300 output tokens, a candidate
+# costs a writer call (~5.5k in / 4.3k out), an audit call (~4.5k in) and a triage
+# run. So the PROPOSAL distribution can be widened two orders of magnitude more
+# cheaply than the compute bill. Propose 6-8, execute at most 4.
+#
+# Budget check: 4 triage runs plus 3 survivors x 2 seeds at ~60s each is roughly
+# 10 minutes per iteration, about 36 iterations inside the 6h ceiling.
+MAX_CANDIDATES_PER_ITER = 4
+
+# Mechanisms whose named primitive cannot be written in numpy on one core inside
+# the triage cap. Checked against the mechanism AND the implementation sketch.
+#
+# Not a style preference: 61 of the 65 stored proposals from earlier runs named
+# something in this list — MAML and other meta-learning, ColdNAS and neural
+# architecture search, DeepFM / xDeepFM, contrastive objectives, SAM/ASAM,
+# frequency-decomposed state-space models, a small LLM for token augmentation —
+# a ~94% unimplementable rate WITH the constraint block already in the persona.
+# Rejecting them before a writer call is spent costs nothing and saves ~5.5k
+# input + 4.3k output tokens each.
+_INFEASIBLE_TOKENS: tuple[str, ...] = (
+    "maml", "meta-learning", "meta learning", "coldnas",
+    "neural architecture search", "architecture search",
+    "deepfm", "xdeepfm", "transformer", "attention layer", "self-attention",
+    "state-space", "state space model", "contrastive", "sam optimizer", "asam",
+    "torch", "pytorch", "tensorflow", "keras", "sklearn", "scikit-learn",
+    "pandas", "huggingface", "pretrained", "pre-trained", "embedding model",
+    "large language model", "llm-based", "gnn", "graph neural",
+    "variational autoencoder", "diffusion model", "reinforcement learning",
+)
+
 # Where the best-scoring candidate's source is archived. The staged candidate
 # dirs live under tempfile.gettempdir() and are not durable — on the run that
 # produced orchestrator/_state/ they were /var/folders/... which macOS clears.
@@ -118,6 +163,13 @@ NOOP_EPSILON = 1e-9
 # first didn't.
 MAX_FIX_ATTEMPTS = 2
 
+# Repair attempts against the SMOKE stage, which costs ~0.06s on 200 synthetic
+# rows instead of 240s on 1.4M. Higher than MAX_FIX_ATTEMPTS because the two
+# budgets buy different things: this one buys attempts at a nearly-free signal,
+# and only code that already runs reaches the expensive one. Raising the attempt
+# budget without raising the bill is the entire point of the stage.
+MAX_SMOKE_FIX_ATTEMPTS = 5
+
 # Wall-clock cap for the 1-seed triage run. The unmodified baseline trains and
 # scores valid_search in 18s measured on this machine (early-stopping at epoch
 # 11 at ~1.1s/epoch), so the old 120s was only 6.7x the baseline — enough to
@@ -127,7 +179,30 @@ MAX_FIX_ATTEMPTS = 2
 # hypothesis thrown away. 240s is 13x the baseline and still well under the
 # 600s full-seed cap, so a candidate that clears triage cannot then time out
 # on seeds 1 and 2.
-TRIAGE_WALLCLOCK_CAP_S = 240
+# ADAPTIVE triage cap (T2.11). Replaces a flat TRIAGE_WALLCLOCK_CAP_S = 240. cap = clamp(TRIAGE_RUNTIME_MULTIPLE * parent's own
+# last clean runtime, TRIAGE_CAP_MIN_S, TRIAGE_CAP_MAX_S).
+#
+# The flat constant measured tolerance against the ROOT, forever. The baseline
+# runs in ~40s, so a flat 240s already tolerates a 6x slowdown and a flat 500s
+# tolerates 12x — raising the constant buys tolerance for inefficiency rather
+# than for genuinely expensive mechanisms. Scaling off the parent's own cost is
+# what starts to matter once a promoted candidate is itself slower than the root:
+# under a flat cap, every child of it inherits a budget measured against
+# something cheaper than its own parent.
+#
+# Paired with the T1.6 smoke stage the cap is only ever PAID by code already
+# proven to run correctly on 200 rows, so a raise costs measurement time instead
+# of debugging time.
+#
+# The ceiling stays at the full-run cap (600s) so nothing can clear triage and
+# then time out at higher fidelity — the failure mode that would waste the most.
+TRIAGE_RUNTIME_MULTIPLE = 4
+TRIAGE_CAP_MIN_S = 300
+TRIAGE_CAP_MAX_S = 600
+
+# Wall-clock cap for a full-seed run. Also the ceiling on the adaptive triage
+# cap, for the reason above.
+FULL_RUN_WALLCLOCK_CAP_S = 600
 
 # Plateau stop calibration. Deliberately NOT convergence.local_plateau's own
 # defaults (ε=0.002, N=3), which are unreachable on this task.
@@ -207,6 +282,160 @@ DATA_DIR = os.environ.get("CODEGEN_DATA_DIR",
 FALLBACK_ROOT_PRIMARY = 0.5946
 
 
+class _NullLedger:
+    """Stand-in when llm_calls.usage is unavailable. Reports nothing, honestly."""
+
+    def reset(self):
+        pass
+
+    def totals(self):
+        return {"calls": 0, "tokens_in": 0, "tokens_cached": 0, "tokens_out": 0,
+                "tokens_reasoning": 0, "web_searches": 0,
+                "calls_without_usage": 0, "tokens_total": 0,
+                "estimated_cost_usd": 0.0, "by_kind": {}}
+
+
+def _usage_ledger():
+    """The shared token ledger, or a no-op stand-in.
+
+    Resolved at CALL time rather than imported at module scope so accounting can
+    never make this module unimportable, and so a test can swap the ledger.
+    """
+    try:
+        from llm_calls.usage import LEDGER
+        return LEDGER
+    except Exception:                           # noqa: BLE001 — see docstring
+        return _NullLedger()
+
+
+def _using_mocks() -> bool:
+    """True when --mock (or a test) swapped the module-level bindings.
+
+    Read off the bound module's own name rather than a flag, so it is correct
+    however the swap was performed — the CLI rebinds these globals and eleven
+    test modules monkeypatch them.
+    """
+    return getattr(codegen, "__name__", "").startswith("orchestrator.mocks")
+
+
+def _model_report() -> dict:
+    """Everything about model routing this run will bill to, as data.
+
+    Structured rather than printed so three callers can share it: the startup
+    banner, `--check-models`, and progress.json (T2.4). Every field is read
+    defensively — this is reporting, and reporting must never be the reason a
+    6-hour unattended run fails to start.
+    """
+    rep: dict = {"using_mocks": _using_mocks()}
+
+    # WRITER. Two values, deliberately: what the environment ASKS for, and what
+    # the backend will ACTUALLY call. `_auto_backend` silently returns
+    # FakeBackend when OPENAI_API_KEY is unset or the SDK import fails, so
+    # reporting only the first announces a frontier model while canned
+    # single-token edits are served — which is strictly worse than reporting
+    # nothing, because it reads like the run is working.
+    try:
+        from codegen.llm_client import (DEFAULT_WRITER_MODEL,
+                                        resolved_writer_model)
+        rep["writer_requested"] = resolved_writer_model()
+        rep["writer_source"] = ("env CODEGEN_LLM_MODEL"
+                                if os.environ.get("CODEGEN_LLM_MODEL")
+                                else f"code default {DEFAULT_WRITER_MODEL}")
+    except Exception as e:                      # noqa: BLE001 — see docstring
+        rep["writer_requested"] = f"unknown ({type(e).__name__}: {e})"
+        rep["writer_source"] = "unknown"
+
+    rep["backend_env"] = os.environ.get("CODEGEN_LLM_BACKEND") or "auto"
+    rep["api_key_set"] = bool(os.environ.get("OPENAI_API_KEY")
+                              or os.environ.get("LLM_CALLS_API_KEY"))
+    try:
+        from codegen.llm_client import get_default_client
+        client = get_default_client()
+        rep["backend"] = client.backend_name
+        rep["is_fake"] = client.is_fake
+        rep["writer_effective"] = client.backend_model
+    except Exception as e:                      # noqa: BLE001
+        # Selecting "openai" with no key raises here. That is a real
+        # misconfiguration and --check-models must report it, not hide it.
+        rep["backend"] = f"UNAVAILABLE ({type(e).__name__}: {e})"
+        rep["is_fake"] = None
+        rep["writer_effective"] = None
+
+    # REASONER. A separate knob on purpose: the writer produces diffs (a 60%
+    # failure rate in the recorded run), the reasoner produces diagnoses and
+    # hypotheses. One number for "the model" cannot say which to spend on.
+    try:
+        from llm_calls import client as _lc
+        rep["reasoner"] = _lc.DEFAULT_MODEL
+        rep["cheap"] = _lc.DEFAULT_CHEAP_MODEL
+        rep["max_output_tokens"] = _lc.MAX_OUTPUT_TOKENS
+    except Exception as e:                      # noqa: BLE001
+        rep["reasoner"] = rep["cheap"] = f"unknown ({type(e).__name__}: {e})"
+        rep["max_output_tokens"] = None
+
+    # Per-persona routing, once T2.4 provides it.
+    try:
+        from llm_calls.routing import resolved_table
+        rep["routing"] = resolved_table()
+    except Exception:                           # noqa: BLE001
+        rep["routing"] = None
+    return rep
+
+
+def _print_model_banner(rep: dict | None = None) -> None:
+    """The startup block: every model, its source, and the backend actually used."""
+    rep = rep or _model_report()
+    eff = rep.get("writer_effective")
+    if rep.get("is_fake"):
+        eff_str = "FakeBackend — CANNED OUTPUT, NOT THIS MODEL"
+    elif eff:
+        eff_str = f"backend will call {eff}"
+    else:
+        eff_str = "backend model unknown"
+    print(f"[models] writer={rep.get('writer_requested')} "
+          f"(from {rep.get('writer_source')}; {eff_str})")
+    print(f"[models] reasoner={rep.get('reasoner')} (LLM_CALLS_MODEL) | "
+          f"dedup={rep.get('cheap')} (LLM_CALLS_CHEAP_MODEL) | "
+          f"max_output_tokens={rep.get('max_output_tokens')}")
+    print(f"[models] backend={rep.get('backend')} "
+          f"(CODEGEN_LLM_BACKEND={rep.get('backend_env')}, "
+          f"api_key_set={rep.get('api_key_set')}, "
+          f"mocks={rep.get('using_mocks')})")
+    for persona, cfg in (rep.get("routing") or {}).items():
+        print(f"[models]   {persona:22s} {cfg.get('model')} "
+              f"effort={cfg.get('effort')}")
+
+
+class FakeBackendInRealRunError(RuntimeError):
+    """Raised when a real run would silently write canned edits.
+
+    `codegen/llm_client.py::_auto_backend` returns FakeBackend whenever
+    OPENAI_API_KEY is unset or the SDK import fails, with no warning — so a run
+    with a bad key produces gate-clean single-token edits, scores them, and looks
+    like it is working. Every candidate is then a measurement of the fake
+    backend. This is the one place that turns that into a stop.
+    """
+
+
+def _require_real_models(rep: dict | None = None) -> dict:
+    """Refuse to start a real search on a fake backend. Returns the report."""
+    rep = rep or _model_report()
+    if rep["using_mocks"]:
+        return rep                      # --mock is an explicit, honest choice
+    if rep.get("is_fake"):
+        raise FakeBackendInRealRunError(
+            f"codegen would use FakeBackend for a REAL run: canned edits, "
+            f"scored as if measured. backend_env="
+            f"{rep.get('backend_env')!r}, api_key_set={rep.get('api_key_set')}. "
+            f"Set OPENAI_API_KEY (and CODEGEN_LLM_BACKEND=openai), or pass "
+            f"--mock if a mocked run is what you wanted.")
+    if rep.get("is_fake") is None:
+        raise FakeBackendInRealRunError(
+            f"codegen could not build an LLM backend: {rep.get('backend')}. "
+            f"api_key_set={rep.get('api_key_set')}.")
+    return rep
+
+
 def _new_id() -> str:
     return uuid.uuid4().hex[:8]
 
@@ -252,9 +481,11 @@ def _measure_root(root: Node, counters: Counters, *, seeds=ROOT_SEEDS,
     if blob is None:
         measured = {}
         for s in seeds:
+            _t0 = time.time()
             r = codegen.execute(root.code_path, seed=s, split=split,
                                 wallclock_cap_seconds=wallclock_cap_s, root=".",
                                 data_dir=DATA_DIR)
+            _elapsed = time.time() - _t0
             counters.bump("full_runs")
             counters.bump_scorer(split)
             if r["status"] != "ok":
@@ -262,6 +493,16 @@ def _measure_root(root: Node, counters: Counters, *, seeds=ROOT_SEEDS,
                     print(f"[root] baseline seed={s} {r['status']}; skipping seed")
                 continue
             measured[str(s)] = {"primary": r["metrics"]["primary"],
+                                # Measured runtime, cached alongside the scores,
+                                # so the adaptive triage cap has a real number to
+                                # scale off from the very first iteration.
+                                "runtime_s": _elapsed,
+                                # Both components, so the root has per-metric
+                                # values for candidates to be compared against.
+                                # A cache written before T2.8 has neither, which
+                                # is handled below.
+                                "GAUC": r["metrics"].get("GAUC"),
+                                "nDCG@5": r["metrics"].get("nDCG@5"),
                                 "per_user": r["metrics"].get("per_user", {})}
         if not measured:
             if verbose:
@@ -285,6 +526,21 @@ def _measure_root(root: Node, counters: Counters, *, seeds=ROOT_SEEDS,
     root.per_user_by_seed = per_user
     root.seeds_run = sorted(per_user)
     root.per_seed_primary = {int(s): v["primary"] for s, v in blob["seeds"].items()}
+    # `.get`, not `[...]`: a root_baseline.json written before T2.8 has only
+    # `primary`, and re-measuring the baseline to backfill two reporting fields
+    # would cost three full training runs. A cache from before the change simply
+    # reports no per-metric split for the root.
+    root.per_seed_gauc = {int(s): v["GAUC"] for s, v in blob["seeds"].items()
+                          if v.get("GAUC") is not None}
+    root.per_seed_ndcg5 = {int(s): v["nDCG@5"] for s, v in blob["seeds"].items()
+                           if v.get("nDCG@5") is not None}
+    _runtimes = [v["runtime_s"] for v in blob["seeds"].values()
+                 if v.get("runtime_s")]
+    # MEDIAN, not mean: a single cold-cache first seed should not inflate every
+    # child's cap for the rest of the run.
+    if _runtimes:
+        _runtimes.sort()
+        root.clean_runtime_s = _runtimes[len(_runtimes) // 2]
     # MEAN, not max. See _scalar_primary: the root runs 3 seeds and most
     # candidates finish only a 1-seed triage run, so a max-vs-max comparison
     # gave the root a free E[max of 3] - E[max of 1] ~= 0.85*sigma head start.
@@ -337,71 +593,130 @@ def _measure_confirm_baseline(counters: Counters, *, seeds=CONFIRM_SEEDS,
     return {int(s): v.get("per_user", {}) for s, v in measured.items()}
 
 
-#: Mechanism families for fingerprinting, checked in order — first match wins,
-#: so put the specific surrogates ahead of the generic "pairwise/listwise"
-#: bucket they belong to. Deliberately coarse: the point is that two proposals
-#: which would produce substantially the same edit collapse to one entry, not
-#: that the taxonomy is complete. Unmatched mechanisms fall through to a prose
-#: hash, which is the old behaviour and stays permissive for genuinely novel
-#: ideas.
-_MECHANISM_FAMILIES: tuple[tuple[str, tuple[str, ...]], ...] = (
-    ("lambdarank_surrogate", ("lambdarank", "lambda rank", "lambda-weight",
-                              "lambda weight")),
-    ("ranknet_pairwise", ("ranknet", "rank net")),
-    ("bpr_pairwise", ("bpr", "bayesian personalized ranking",
-                      "bayesian personalised ranking")),
-    ("listwise_softmax", ("listwise", "list-wise", "within-user softmax",
-                          "softmax over these scores", "softmax loss")),
-    ("generic_pairwise", ("pairwise loss", "pairwise ranking", "pair-wise")),
-    ("multitask_auxiliary", ("multi-task", "multitask", "auxiliary task",
-                             "auxiliary loss", "esmm")),
-    ("sequence_features", ("sequence", "behaviour history", "behavior history",
-                           "user history", "din", "target attention")),
-    ("watchtime_censored", ("censored", "watch time", "watch-time",
-                            "play_time")),
-    ("capacity_or_regularization", ("embedding dimension", "embedding dim",
-                                    "increase k", "weight decay", "dropout",
-                                    "l2 regularization", "l2 regularisation")),
-    ("static_feature_domains", ("add feature", "additional feature",
-                               "more feature", "feature domain",
-                               "extra categorical")),
-    ("negative_sampling", ("negative sampling", "sample negatives",
-                           "hard negative")),
-    ("gbdt_swap", ("lightgbm", "gbdt", "gradient boost")),
-    ("ensemble_blend", ("ensemble", "blend", "stack")),
-)
+#: The mechanism-family taxonomy now lives in llm_calls/families.py, because
+#: T2.6 makes the family a DECLARED schema field and the schema layer has to
+#: validate against the same list. Re-exported under the historical names so
+#: nothing that reads them from here has to change.
+_MECHANISM_FAMILIES = MECHANISM_FAMILIES
+ALL_FAMILIES = _FAMILY_NAMES
 
 
 def _fingerprint(h: dict):
     """Semantic fingerprint of a hypothesis.
 
-    If the hypothesis declares structured fields, use them (this keeps the
-    hand-authored preseeds in memory.py meaningful). Otherwise fall back to
-    a hash of the mechanism string, so distinct proposals don't all collapse
-    to the same default 4-tuple.
+    Three branches, in precedence order.
+
+    1. A DECLARED `mechanism_family`. This is what production now emits (T2.6),
+       and it makes the fingerprint exact. The substring branch below could not
+       be: family assignment depended on hand-ordered table position, so "a
+       pairwise loss over user history" resolved to `generic_pairwise` rather
+       than `sequence_features` purely because the loss families are checked
+       first, and the bare token `sequence` swallowed any hypothesis containing
+       that word anywhere.
+
+    2. Structured fields, which keep the hand-authored preseeds in memory.py
+       meaningful. Note `_reject_unknown_keys` forbids all four on a real
+       hypothesis, so this branch is reachable only from a preseed or a test —
+       which is exactly why the family collision was unreachable in every test
+       before Tier 1: the mock supplied these keys with a per-iteration digest.
+
+    3. The substring fallback, then a prose hash. Retained for a hypothesis that
+       declared nothing (an older mock, a hand-built dict) and permissive for
+       genuinely novel ideas.
     """
+    declared = normalise_declaration(h.get("mechanism_family"))
+    if declared and declared != OTHER:
+        return ("mechanism_family", declared, "", "")
+    if declared == OTHER:
+        # The escape hatch is never a family, so it can never be blocked as one.
+        # Hash the prose instead, which gives each `other` its own identity.
+        mech = (h.get("mechanism") or "").strip().lower()
+        digest = hashlib.sha1(mech.encode("utf-8")).hexdigest()[:16]
+        return ("mechanism_hash", digest, "", "")
+
     structured_keys = ("loss_type", "sampler", "feature_set", "dataset_tier")
     if any(k in h for k in structured_keys):
         return (h.get("loss_type", "pointwise_logloss"),
                 h.get("sampler", "uniform"),
                 h.get("feature_set", "5field_baseline"),
                 h.get("dataset_tier", "pure"))
-    # No structured fields: classify the mechanism into a FAMILY rather than
-    # hashing its prose. Hashing prose made dedup dead code — every proposal in
-    # the 5-iteration run was a loss swap, but each was worded differently, so
-    # each hashed differently and memory.is_duplicate (an exact tuple match)
-    # never fired once across 11 candidates. Matching on family means the
-    # second "replace pointwise logloss with BPR" is recognised as the first
-    # one no matter how it is phrased.
+
     mech = (h.get("mechanism") or "").strip().lower()
     sketch = (h.get("implementation_sketch") or "").strip().lower()
-    text = f"{mech} {sketch}"
-    family = next((fam for fam, tokens in _MECHANISM_FAMILIES
-                   if any(t in text for t in tokens)), None)
+    family = family_from_text(f"{mech} {sketch}")
     if family is not None:
         return ("mechanism_family", family, "", "")
     digest = hashlib.sha1(mech.encode("utf-8")).hexdigest()[:16]
     return ("mechanism_hash", digest, "", "")
+
+
+#: Aliases onto the shared taxonomy (llm_calls/families.py), kept so the local
+#: reads stay short. `other` is the escape hatch: a mechanism declaring it gets a
+#: prose hash rather than a family, so no family entry can ever block it.
+_ALL_FAMILIES: tuple[str, ...] = _FAMILY_NAMES
+_OTHER_FAMILY = OTHER
+
+
+def _family_of(fp) -> str | None:
+    """The mechanism-family name a fingerprint names, or None if it names none.
+
+    Only `_fingerprint`'s family branch carries a family; the structured
+    preseeds and the prose-hash fallback do not.
+    """
+    return fp[1] if fp and fp[0] == "mechanism_family" else None
+
+
+def _family_standing(memory: Memory) -> tuple[List[str], List[str], List[str]]:
+    """(refuted, probationary, legal) mechanism families, per the evidence store.
+
+    THE missing input on the proposal side. `_ask`'s context carried parent,
+    history, iter_history, improvement_score, ablations, tried,
+    component_ledger and exhausted_components — and nothing whatsoever about
+    which mechanism families memory had already retired. So the diagnostician
+    was being asked to avoid a constraint it could not see: it proposed into a
+    banned family, the filter below silently deleted the result, and neither
+    side ever learned anything. Iteration 4 of the recorded run did this 3 for 3
+    and returned zero candidates.
+
+    `refuted` are hard blocks. `probationary` have one scored refutation and are
+    still proposable — the discount is rendered into the prompt rather than
+    enforced as a filter, because generalising a single categorical-field
+    experiment to a whole family is the unsound step, not the measurement.
+    """
+    refuted, probationary = [], []
+    on_probation = set(memory.probationary_families())   # hoisted: O(n^2) each
+    for fam in _ALL_FAMILIES:
+        fp = ("mechanism_family", fam, "", "")
+        if _memory_blocks(memory, fp):
+            refuted.append(fam)
+        elif fam in on_probation:
+            probationary.append(fam)
+    legal = [f for f in _ALL_FAMILIES if f not in refuted] + [_OTHER_FAMILY]
+    return refuted, probationary, legal
+
+
+def _infeasible_reason(h: dict) -> str | None:
+    """The named primitive that cannot be written here, or None.
+
+    Deterministic and free, run BEFORE a writer call is spent. The persona
+    already carries a constraint block naming these, and 61 of 65 stored
+    proposals violated it anyway — so a prompt request is demonstrably not
+    enough, and this is the same "enforce it in the loop, not only in the
+    prompt" move as the component-exhaustion budget.
+    """
+    text = (f"{h.get('mechanism') or ''} "
+            f"{h.get('implementation_sketch') or ''}").lower()
+    return next((t for t in _INFEASIBLE_TOKENS if t in text), None)
+
+
+def _memory_blocks(memory: Memory, fp) -> bool:
+    """Does the evidence store refuse a proposal at this fingerprint?
+
+    The POLICY question, kept separate from `Memory.is_duplicate`'s EVIDENCE
+    question ("is a refutation recorded here"). T1.4 makes the policy require
+    corroboration; this indirection is the single place the driver asks.
+    """
+    return memory.is_blocked(fp)
 
 
 def _diff_hash(diff: str) -> str:
@@ -422,6 +737,70 @@ def _best_primary(c: Node) -> float:
     if c.local_best_score > float("-inf"):
         scores.append(c.local_best_score)
     return max(scores) if scores else float("-inf")
+
+
+#: Per-metric ceilings on this dataset. The oracle primary is 0.8645, and it is
+#: NOT the mean of two equal halves: a perfect ranking gives GAUC 1.0 but nDCG@5
+#: only 0.7289, because users with zero positives score 0 and are counted in the
+#: average. So the headroom is lopsided — 0.3390 on GAUC against 0.2007 on
+#: nDCG@5 from the baseline — and a diagnostician that sees one scalar cannot
+#: know which gap is bigger.
+GAUC_CEILING = 1.0
+NDCG5_CEILING = 0.7289
+
+#: Baseline hidden-test values, for the distance-to-ceiling report.
+BASELINE_GAUC = 0.6610
+BASELINE_NDCG5 = 0.5282
+
+
+def _triage_cap_for(parent: Node) -> int:
+    """The wall-clock cap for a triage run of one of `parent`'s children.
+
+    Derived from the PARENT's own last clean runtime, clamped to
+    [TRIAGE_CAP_MIN_S, TRIAGE_CAP_MAX_S]. Falls back to the minimum when the
+    parent has no measured runtime — which is strictly more generous than the old
+    flat 240s, and the smoke stage means only correct code ever reaches it.
+    """
+    rt = getattr(parent, "clean_runtime_s", None)
+    if not rt or rt <= 0:
+        return TRIAGE_CAP_MIN_S
+    return int(max(TRIAGE_CAP_MIN_S,
+                   min(TRIAGE_CAP_MAX_S, TRIAGE_RUNTIME_MULTIPLE * rt)))
+
+
+def _mean_metric(per_seed: dict) -> float | None:
+    """Mean over the seeds a node actually ran, or None if it ran none."""
+    if not per_seed:
+        return None
+    return sum(per_seed.values()) / len(per_seed)
+
+
+def _metric_block(c: Node) -> dict:
+    """Both metrics for one node, each with its own distance to its own ceiling.
+
+    THE resolution the diagnostician was missing. `gauc_to_ceiling` and
+    `ndcg5_to_ceiling` are the two numbers that say where the headroom actually
+    is; a scalar primary averages them and hides the asymmetry.
+    """
+    gauc = _mean_metric(c.per_seed_gauc)
+    ndcg = _mean_metric(c.per_seed_ndcg5)
+    return {
+        "GAUC": gauc,
+        "nDCG@5": ndcg,
+        "gauc_to_ceiling": (GAUC_CEILING - gauc) if gauc is not None else None,
+        "ndcg5_to_ceiling": (NDCG5_CEILING - ndcg) if ndcg is not None else None,
+        "n_seeds": len(c.per_seed_primary),
+    }
+
+
+def _record_metrics(c: Node, seed: int, metrics: dict) -> None:
+    """Store primary AND both components for one seed of one node."""
+    c.per_seed_primary[seed] = metrics["primary"]
+    if metrics.get("GAUC") is not None:
+        c.per_seed_gauc[seed] = float(metrics["GAUC"])
+    if metrics.get("nDCG@5") is not None:
+        c.per_seed_ndcg5[seed] = float(metrics["nDCG@5"])
+    c.per_user_by_seed[seed] = metrics.get("per_user", {})
 
 
 def _scalar_primary(c: Node) -> float:
@@ -470,6 +849,14 @@ def _write_json_atomic(path: str, payload: dict) -> None:
     os.replace(tmp, path)   # atomic: tailing mid-run never sees a partial write
 
 
+def _write_text_atomic(path: str, text: str) -> None:
+    os.makedirs(os.path.dirname(path) or ".", exist_ok=True)
+    tmp = path + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as fh:
+        fh.write(text)
+    os.replace(tmp, path)
+
+
 def _append_nodes_log(candidates: List[Node], iter_no: int,
                       path: str | None = None) -> None:
     """Append one JSON object per candidate to nodes.jsonl.
@@ -499,6 +886,13 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
                 "hypothesis": c.hypothesis,
                 "diagnosis": c.diagnosis,
                 "per_seed_primary": c.per_seed_primary,
+                # Both components per seed. Section 2.5 requires them in the
+                # submitted run log, and a scalar primary cannot show that a
+                # change gained on GAUC and lost on nDCG@5.
+                "per_seed_gauc": c.per_seed_gauc,
+                "per_seed_ndcg5": c.per_seed_ndcg5,
+                "GAUC": _mean_metric(c.per_seed_gauc),
+                "nDCG@5": _mean_metric(c.per_seed_ndcg5),
                 "mean_delta": c.mean_delta,
                 "p_positive": c.p_positive,
                 "lower_95": c.lower_95,
@@ -509,6 +903,10 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
                 # reason lived only in the run log, and the verdict did not
                 # exist, so "refuted" and "never implemented" and "criterion
                 # uncalibrated by 8x" were one indistinguishable record.
+                # The leak control's result, alongside the real score. The pair
+                # is the evidence; either number alone says nothing.
+                "confirm_primary": c.confirm_primary,
+                "permuted_primary": c.permuted_primary,
                 "last_error_excerpt": c.last_error_excerpt,
                 "verdict": c.verdict,
                 "verdict_reason": c.verdict_reason,
@@ -595,6 +993,12 @@ def _attempt_ledger(nodes: List[Node], parent: Node,
             "outcome": n.evidence_type or ("scored" if n.per_seed_primary
                                            else "unresolved"),
             "primary": _scalar_primary(n) if n.per_seed_primary else None,
+            # Both metrics, not just their mean. A change that gained on GAUC and
+            # lost on nDCG@5 was indistinguishable from one that did nothing, and
+            # the headroom is lopsided (0.3390 on GAUC vs 0.2007 on nDCG@5), so
+            # the proposer could not aim at the larger gap.
+            "GAUC": _mean_metric(n.per_seed_gauc),
+            "nDCG@5": _mean_metric(n.per_seed_ndcg5),
             "mean_delta_vs_parent": n.mean_delta,
             # The grader's read on the criterion this attempt declared, and what
             # it recommends doing with the mechanism family. Without these the
@@ -606,12 +1010,6 @@ def _attempt_ledger(nodes: List[Node], parent: Node,
             "next_action": n.next_action,
         })
     return out[-max_entries:]
-
-
-#: Token cost charged per verdict call. One call per SCORED candidate only —
-#: the unscored ones never reach the survivors loop — so at 3 survivors an
-#: iteration this is a rounding error against the 800 the writer already spends.
-VERDICT_TOKENS = 400
 
 
 def _apply_verdict(c: Node, parent: Node, root: Node, verdict_llm,
@@ -648,7 +1046,6 @@ def _apply_verdict(c: Node, parent: Node, root: Node, verdict_llm,
             print(f"  {c.id} verdict unavailable ({type(e).__name__}: {e}); "
                   f"continuing without one")
         return
-    counters.bump("tokens", VERDICT_TOKENS)
     c.verdict = v["verdict"]
     c.verdict_reason = v["reason"]
     c.next_action = v["next_action"]
@@ -809,6 +1206,228 @@ def _ancestor_chain(node: Node, all_nodes: List[Node],
     return out
 
 
+# --------------------------------------------------------------------------- #
+#  Run-wide failure digest (T3.2)                                              #
+# --------------------------------------------------------------------------- #
+# WHY IT IS NOT THE ANCESTOR CHAIN. `_ancestor_chain` walks ancestors only, by
+# design — a descendant inherits its parent's staged code, so its parent's
+# failures are the relevant ones. But the two identical `encode` crashes in the
+# recorded run were SIBLINGS: both children of the root in iteration 2, two
+# candidates that extended raw(x) without extending FIELDS and died with the same
+# IndexError at the same line. Neither could see the other's traceback, because
+# neither is an ancestor of the other.
+#
+# Two failures with the same signature are the cheapest learning signal a search
+# can get — the second one already knows the answer if it can see the first. This
+# indexes by (file, exception_type, line) rather than by tree position, because
+# that is how the failures actually cluster.
+#
+# After T1.6 the digest also fills from SMOKE rejections, which cost ~0.06s each
+# instead of 240s, so the signal accumulates at near-zero price.
+
+#: Cap, matching LEDGER_MAX_ENTRIES' reasoning: this text goes into a repair
+#: prompt alongside a whole source file.
+DIGEST_MAX_PER_SIGNATURE = 4
+
+#: Last frame of a traceback: `File "...", line N, in name` then the exception.
+_TB_FRAME_RE = re.compile(r'File "([^"]+)", line (\d+)')
+_TB_EXC_RE = re.compile(r"^(\w+(?:Error|Exception|Warning))\s*:", re.MULTILINE)
+
+
+def _failure_signature(log: str) -> tuple | None:
+    """(file, exception_type, line) for the DEEPEST frame of a traceback.
+
+    The deepest frame is the one that says what to fix; the outer frames are the
+    call path that got there and are identical for every candidate. Returns None
+    when the log carries no recognisable traceback — a timeout, for instance,
+    which has no signature and must not be filed under a fake one.
+    """
+    if not log:
+        return None
+    frames = _TB_FRAME_RE.findall(log)
+    excs = _TB_EXC_RE.findall(log)
+    if not frames or not excs:
+        return None
+    path, line = frames[-1]
+    return (os.path.basename(path), excs[-1], int(line))
+
+
+class FailureDigest:
+    """Prior failures and repairs, indexed by signature, for the whole run."""
+
+    def __init__(self, max_per_signature: int = DIGEST_MAX_PER_SIGNATURE):
+        self.max_per_signature = max_per_signature
+        self.by_signature: dict = {}
+
+    def record(self, log: str, *, node_id: str, mechanism: str | None,
+               repair_attempted: str | None = None,
+               repaired: bool | None = None,
+               stage: str = "execute") -> tuple | None:
+        """File one failure. Returns its signature, or None if it has none."""
+        sig = _failure_signature(log)
+        if sig is None:
+            return None
+        entries = self.by_signature.setdefault(sig, [])
+        entries.append({
+            "node_id": node_id,
+            "mechanism": (mechanism or "")[:160],
+            "stage": stage,
+            "repair_attempted": (repair_attempted or "")[:400] or None,
+            # None = not yet known, True/False = the rerun's verdict. This is the
+            # field that makes the digest worth more than a list of tracebacks:
+            # "three candidates hit this and none of the repairs worked" is
+            # actionable in a way "three candidates hit this" is not.
+            "repaired": repaired,
+        })
+        del entries[:-self.max_per_signature]
+        return sig
+
+    def note_repair(self, sig, *, node_id: str, diff: str) -> None:
+        """Attach the repair diff that was tried for `node_id`'s failure.
+
+        Truncated hard: this goes into a prompt that already carries a whole
+        source file, and the first few hunks are what say what was attempted.
+        """
+        for e in reversed(self.by_signature.get(sig) or []):
+            if e["node_id"] == node_id:
+                e["repair_attempted"] = diff[:400]
+                return
+
+    def resolve(self, sig, *, node_id: str, repaired: bool) -> None:
+        """Record whether the repair for `node_id`'s failure at `sig` worked."""
+        for e in reversed(self.by_signature.get(sig) or []):
+            if e["node_id"] == node_id:
+                e["repaired"] = repaired
+                return
+
+    def matching(self, log: str, *, exclude_node: str | None = None) -> List[dict]:
+        """Prior failures sharing this log's signature, excluding `exclude_node`.
+
+        Empty when the signature is new, which is the common case early in a run
+        and is exactly when there is nothing useful to say.
+        """
+        sig = _failure_signature(log)
+        if sig is None:
+            return []
+        return [e for e in (self.by_signature.get(sig) or [])
+                if e["node_id"] != exclude_node]
+
+    def summary(self) -> List[dict]:
+        """Signatures seen more than once, for the run log. The repeats are the
+        interesting part: a signature seen once is a bug, seen three times is a
+        systematic gap in what the writer is being told."""
+        return sorted(
+            ({"file": sig[0], "exception": sig[1], "line": sig[2],
+              "count": len(entries),
+              "repairs_that_worked": sum(1 for e in entries if e["repaired"]),
+              "nodes": [e["node_id"] for e in entries]}
+             for sig, entries in self.by_signature.items() if len(entries) > 1),
+            key=lambda r: -r["count"])
+
+
+# --------------------------------------------------------------------------- #
+#  Leak controls on the promotion path (T3.4)                                  #
+# --------------------------------------------------------------------------- #
+#: Highest primary a LABEL-PERMUTED run may score before the candidate is treated
+#: as reading the label.
+#:
+#: Calibrated by measurement, not guessed. Running the unmodified baseline on
+#: valid_search with each user's labels shuffled among that user's own rows:
+#:
+#:     real      primary 0.5938   GAUC 0.6631   nDCG@5 0.5246
+#:     permuted  primary 0.4840   GAUC 0.4998   nDCG@5 0.4682
+#:
+#: GAUC lands on 0.4998 against a theoretical 0.5, which is the control working
+#: exactly as intended. 0.55 sits 0.066 above that measured null and 0.044 below
+#: the real baseline, so it separates the two cleanly with room on both sides.
+PERMUTATION_MAX_PRIMARY = 0.55
+
+#: The measured null, kept for the log line so a reader can see how far a
+#: control run was from where it should be.
+PERMUTED_BASELINE_PRIMARY = 0.4840
+
+
+def _leak_check(c: Node, cand_dir: str, counters: Counters, *,
+                confirm_primary: float | None, history: List[float] | None = None,
+                verbose: bool = True) -> str | None:
+    """Two deterministic leak controls. Returns a reason to REFUSE, or None.
+
+    Run only on the promotion path, which is the one place worth paying an extra
+    run for: a promotion is what a submission gets generated from, and the
+    advisory LLM auditor cannot be relied on — it flagged 5 of 5 candidates in
+    the recorded run, including "y is being used within the step function", which
+    is the training loop. Its signal-to-noise is zero at ~4,500 input tokens per
+    candidate; a permutation control is deterministic and costs one run.
+
+    1. ORACLE CEILING. A primary above `ORACLE_PRIMARY_CEILING` (0.8645) is
+       physically impossible on this dataset, so it is not a result. The constant
+       already existed and was reachable ONLY through `codegen/debug.py`'s sanity
+       branch, which the driver never triggers because it never passes
+       `observed_score` — so nothing in the loop ever checked it.
+
+    2. LABEL PERMUTATION. Re-score the candidate with each user's labels shuffled
+       among that user's own rows. A model carrying no label information collapses
+       to chance; one reading the label keeps its score. The shuffle is
+       within-user so every user's positive count is preserved, which leaves
+       GAUC's user filter and nDCG's ideal DCG unchanged — see
+       `codegen/sandbox.py::_PERMUTE_SHIM`.
+    """
+    from codegen.constants import ORACLE_PRIMARY_CEILING
+
+    if confirm_primary is not None and confirm_primary > ORACLE_PRIMARY_CEILING:
+        return (f"confirm primary {confirm_primary:.4f} exceeds the oracle "
+                f"ceiling {ORACLE_PRIMARY_CEILING} — physically impossible on "
+                f"this dataset, so it is a leak or a scoring bug, not a result")
+
+    if verbose:
+        print(f"  {c.id} running the label-permutation control on "
+              f"valid_confirm ...")
+    r = codegen.execute(c.code_path, seed=0, split="valid_confirm",
+                        wallclock_cap_seconds=FULL_RUN_WALLCLOCK_CAP_S,
+                        root=cand_dir, data_dir=DATA_DIR,
+                        permute_labels=True)
+    counters.bump("permutation_runs")
+    if r["status"] != "ok":
+        # Inconclusive, NOT a pass. A control that could not run has told us
+        # nothing, and promoting on "the check crashed" is how a leak ships.
+        return (f"the label-permutation control did not run "
+                f"({r['status']}), so the candidate is unverified")
+    permuted = r["metrics"].get("primary")
+    c.permuted_primary = permuted
+    if permuted is None:
+        return "the label-permutation control reported no primary"
+    if permuted > PERMUTATION_MAX_PRIMARY:
+        return (f"label-permutation control scored {permuted:.4f} on SHUFFLED "
+                f"labels (bar {PERMUTATION_MAX_PRIMARY}, measured null "
+                f"{PERMUTED_BASELINE_PRIMARY}). A model with no label "
+                f"information cannot do this — the score is coming from the "
+                f"label, not from the mechanism")
+    # ADVISORY, and free unless the score is implausible: sanity_check returns
+    # None without a model call unless the result is above the oracle ceiling or
+    # a >0.02 leap over the best prior. It adds the one judgement the
+    # deterministic controls above cannot make — whether the diff implements the
+    # stated mechanism at all. It does NOT veto: the auditor's demonstrated
+    # signal-to-noise on this repo is zero, so an LLM opinion is recorded, not
+    # obeyed.
+    try:
+        opinion = codegen.sanity_check(
+            None, hypothesis=c.hypothesis, observed_score=confirm_primary,
+            history=list(history or []), threshold=None)
+    except Exception as e:                          # noqa: BLE001
+        opinion = {"reasoning": f"sanity check unavailable ({e})"}
+    if opinion:
+        c.diagnosis = {**(c.diagnosis or {}), "sanity": opinion}
+        if verbose:
+            print(f"  {c.id} sanity (advisory): "
+                  f"leak_suspected={opinion.get('leak_suspected')} — "
+                  f"{str(opinion.get('reasoning'))[:120]}")
+
+    if verbose:
+        print(f"  {c.id} permutation control OK: {permuted:.4f} on shuffled "
+              f"labels vs {confirm_primary:.4f} real")
+    return None
+
+
 def _prior_refines_for_component(component: str,
                                  path: str | None = None) -> List[dict]:
     """Scan nodes.jsonl for prior refine attempts on this component.
@@ -891,6 +1510,8 @@ def _build_improve_candidates(parent: Node, *,
     tried = tried or []
     component_ledger = component_ledger or {}
     exhausted = _exhausted_components(component_ledger)
+    refuted_families, probationary_families, legal_families = _family_standing(
+        memory)
 
     def _ask(refusal: str | None = None) -> dict:
         ctx = {
@@ -907,84 +1528,270 @@ def _build_improve_candidates(parent: Node, *,
             # budget without producing a gain.
             "component_ledger": component_ledger or None,
             "exhausted_components": sorted(exhausted) or None,
+            # Where the headroom IS, per metric. The oracle primary of 0.8645 is
+            # not two equal halves: a perfect ranking gives GAUC 1.0 but nDCG@5
+            # only 0.7289, because users with zero positives score 0 and are
+            # counted in the average. So from the baseline there is 0.3390 to
+            # gain on GAUC and 0.2007 on nDCG@5, and a diagnostician shown one
+            # averaged number cannot aim at the larger gap.
+            "metric_ceilings": {"GAUC": GAUC_CEILING,
+                                "nDCG@5": NDCG5_CEILING,
+                                "baseline_GAUC": BASELINE_GAUC,
+                                "baseline_nDCG@5": BASELINE_NDCG5,
+                                "baseline_gauc_to_ceiling": round(
+                                    GAUC_CEILING - BASELINE_GAUC, 4),
+                                "baseline_ndcg5_to_ceiling": round(
+                                    NDCG5_CEILING - BASELINE_NDCG5, 4)},
+            "parent_metrics": _metric_block(parent),
+            # Which MECHANISM FAMILIES the evidence store has retired, which
+            # ones carry unconfirmed refuting evidence, and what is left. See
+            # _family_standing: without these the proposer is asked to respect a
+            # constraint it cannot see, and its proposals are silently deleted
+            # for violating it.
+            "refuted_families": refuted_families or None,
+            "probationary_families": probationary_families or None,
+            "legal_families": legal_families,
         }
         if refusal:
             ctx["refusal"] = refusal
         return diag_llm.diagnose(ctx)
 
-    diag = _ask()
-    counters.bump("tokens", 500)
+    def _propose(refusal: str | None = None) -> tuple[dict, List[dict]]:
+        """diagnose (exhaustion budget enforced) → literature → hypotheses.
 
-    # Enforce the exhaustion budget HERE, not only in the prompt. A prompt
-    # request is what failed: the diagnostician kept re-deriving the same
-    # bottleneck from the same flat trajectory because the trajectory really did
-    # look flat, and nothing in the loop could tell it to stop.
-    named = _canonical_component(diag.get("component"))
-    if named in exhausted:
-        if verbose:
-            print(f"  diagnosis named exhausted component {named!r} "
-                  f"({component_ledger[named]['scored']} scored attempts, best "
-                  f"delta {component_ledger[named]['best_mean_delta']}) — "
-                  f"re-asking once")
-        diag = _ask(refusal=(
-            f"You named {diag.get('component')!r}, which is in "
-            f"exhausted_components. That component has already had "
-            f"{component_ledger[named]['scored']} scored attempts whose best "
-            f"paired delta was "
-            f"{component_ledger[named]['best_mean_delta']}, below the "
-            f"{COMPONENT_EXHAUSTED_DELTA} bar. Name the next most load-bearing "
-            f"component instead, and do not name any component listed in "
-            f"exhausted_components."))
-        counters.bump("tokens", 500)
+        Factored out of the straight-line body so the dedup-starvation path
+        below can run the whole proposal step a second time with a refusal,
+        which is what the exhausted-component path a few lines down has always
+        done for its own constraint.
+        """
+        diag = _ask(refusal)
+
+        # Enforce the exhaustion budget HERE, not only in the prompt. A prompt
+        # request is what failed: the diagnostician kept re-deriving the same
+        # bottleneck from the same flat trajectory because the trajectory really
+        # did look flat, and nothing in the loop could tell it to stop.
         named = _canonical_component(diag.get("component"))
-
-    if named in exhausted:
-        # It insisted twice. Substitute deterministically rather than spend a
-        # third call, and record that this happened so the run log shows the
-        # diagnosis was overridden rather than produced.
-        fallback = next((c for c in UNEXPLORED_PRIORITY if c not in exhausted),
-                        None)
-        if fallback is None:
+        if named in exhausted:
             if verbose:
-                print(f"  every priority component is exhausted; keeping "
-                      f"{diag.get('component')!r}")
-            diag["exhaustion_note"] = ("all priority components exhausted; "
-                                       "model's choice kept")
+                print(f"  diagnosis named exhausted component {named!r} "
+                      f"({component_ledger[named]['scored']} scored attempts, best "
+                      f"delta {component_ledger[named]['best_mean_delta']}) — "
+                      f"re-asking once")
+            diag = _ask(refusal=(
+                f"You named {diag.get('component')!r}, which is in "
+                f"exhausted_components. That component has already had "
+                f"{component_ledger[named]['scored']} scored attempts whose best "
+                f"paired delta was "
+                f"{component_ledger[named]['best_mean_delta']}, below the "
+                f"{COMPONENT_EXHAUSTED_DELTA} bar. Name the next most load-bearing "
+                f"component instead, and do not name any component listed in "
+                f"exhausted_components."))
+            named = _canonical_component(diag.get("component"))
+
+        if named in exhausted:
+            # It insisted twice. Substitute deterministically rather than spend a
+            # third call, and record that this happened so the run log shows the
+            # diagnosis was overridden rather than produced.
+            fallback = next((c for c in UNEXPLORED_PRIORITY
+                             if c not in exhausted), None)
+            if fallback is None:
+                if verbose:
+                    print(f"  every priority component is exhausted; keeping "
+                          f"{diag.get('component')!r}")
+                diag["exhaustion_note"] = ("all priority components exhausted; "
+                                           "model's choice kept")
+            else:
+                if verbose:
+                    print(f"  diagnosis insisted on exhausted {named!r}; "
+                          f"falling back to {fallback!r}")
+                diag["exhaustion_fallback"] = {"refused": diag.get("component"),
+                                               "substituted": fallback}
+                diag["component"] = fallback
+
+        # Everything below reads diag["component"], so the substitution above
+        # has to land before this line — the writer is routed at the
+        # replacement, not at the component that was refused.
+        evidence_card = diag_llm.ground_in_literature(diag["bottleneck"])
+        # blocked_families: enforced at the SCHEMA layer, where a retry loop
+        # already exists, so a proposal into a refuted family bounces back to the
+        # model with the reason and the legal set appended. The driver's own
+        # dedup filter below stays as the last line of defence, but it is no
+        # longer the FIRST thing that notices.
+        hypotheses = diag_llm.generate_hypothesis(
+            diag, evidence_card, tried=tried,
+            blocked_families=refuted_families or None)
+        counters.bump("proposals", len(hypotheses))
+        return diag, hypotheses
+
+    def _node_for(diag: dict, h: dict, probation: dict | None = None) -> Node:
+        # Each node gets its own copy of the diagnosis so a per-node annotation
+        # (audit concerns, the probation marker below) cannot leak sideways into
+        # its siblings' records.
+        d = dict(diag)
+        if probation:
+            d["dedup_probation"] = probation
+        return Node(id=_new_id(), parent_id=parent.id,
+                    code_path=parent.code_path, code_dir=parent.code_dir,
+                    operation="improve", diagnosis=d, hypothesis=h)
+
+    def _filter(diag: dict, hypotheses: List[dict]
+                ) -> tuple[List[Node], List[dict], List[dict]]:
+        """Filter a proposal batch down to the candidates worth executing.
+
+        Three deterministic gates, all free, all BEFORE a writer call is spent:
+
+          1. DEDUP — the family carries a corroborated refutation.
+          2. FEASIBILITY — the mechanism names a primitive that cannot be
+             written in numpy on one core. 61 of 65 stored proposals did.
+          3. DIVERSITY — one candidate per family per iteration. 4 of the 5
+             candidates in the recorded run were the same idea
+             (prev_video_id / prev_author_id / prev_long_view / session_depth),
+             so the iteration measured one thing four times.
+
+        Then a hard cap at MAX_CANDIDATES_PER_ITER. Returns
+        (candidates, drop records, dropped hypotheses).
+        """
+        kept: List[Node] = []
+        records: List[dict] = []
+        rejects: List[dict] = []
+        seen_families: set = set()
+
+        def _drop(h, fp, reason):
+            records.append({"mechanism": (h.get("mechanism") or "")[:240],
+                            "family": _family_of(fp) or fp[0],
+                            "fingerprint": list(fp),
+                            "reason": reason})
+            rejects.append(h)
+
+        for h in hypotheses:
+            fp = _fingerprint(h)
+            # A family is retired only by a corroborated REFUTATION, not by any
+            # prior sighting: every scored candidate is recorded here, most as
+            # `inconclusive`, so an unconditional match retired a family after
+            # one indecisive result even when the verdict step said
+            # retry_cheaper or build_on_it. See _memory_blocks.
+            if _memory_blocks(memory, fp):
+                _drop(h, fp, "refuted_family")
+                continue
+            infeasible = _infeasible_reason(h)
+            if infeasible:
+                _drop(h, fp, f"infeasible: names {infeasible!r}")
+                if verbose:
+                    print(f"  dropped (infeasible: {infeasible!r}): "
+                          f"{(h.get('mechanism') or '')[:70]}")
+                continue
+            fam = _family_of(fp)
+            # `other`/prose-hash proposals have no family, so they never collide
+            # on diversity — two novel ideas are two ideas.
+            if fam is not None and fam in seen_families:
+                _drop(h, fp, "duplicate_family_in_batch")
+                continue
+            if len(kept) >= MAX_CANDIDATES_PER_ITER:
+                # Not a failure — the batch was wider than the compute budget,
+                # which is the intended shape. Recorded so the log shows what was
+                # proposed but deferred rather than what was rejected.
+                _drop(h, fp, "over_execution_cap")
+                continue
+            if fam is not None:
+                seen_families.add(fam)
+            kept.append(_node_for(diag, h))
+        return kept, records, rejects
+
+    diag, hypotheses = _propose()
+    candidates, dropped, rejects = _filter(diag, hypotheses)
+
+    if hypotheses and not candidates:
+        # STARVATION. Every proposal fingerprinted into a blocked family, so the
+        # filter emptied the list. Returning [] here is what killed the recorded
+        # run: zero candidates closed the parent, the parent was the root, and
+        # the frontier emptied.
+        #
+        # The recovery is the pattern that already exists ~60 lines above for
+        # exhausted components — enumerate the constraint into the context,
+        # re-ask once, then substitute deterministically. The re-ask alone is not
+        # sufficient and the run proved it: iteration 4's ledger already carried
+        # `next_action: abandon_mechanism` for both families and
+        # llm_calls/hypothesis.py's prompt already said
+        # `abandon_mechanism: FORBIDDEN`, and the model proposed into them 3 for
+        # 3 anyway. So the last-resort branch below is what actually guarantees
+        # liveness.
+        counters.bump("dedup_starved")
+        blocked_now = sorted({d["family"] for d in dropped})
+        # WHY the batch emptied, tallied. It is no longer necessarily dedup: the
+        # feasibility and diversity gates can empty it too, and those call for
+        # completely different corrections — "that primitive cannot be written
+        # here" versus "you proposed the same family repeatedly".
+        why = Counter(d.get("reason", "refuted_family") for d in dropped)
+        why_str = ", ".join(f"{n}x {r}" for r, n in why.most_common())
+        if verbose:
+            print(f"  all {len(hypotheses)} hypotheses dropped ({why_str}) "
+                  f"— widening the ask")
+        reasons_block = ""
+        if any(r.startswith("infeasible") for r in why):
+            named = sorted({d["reason"].split("names ")[-1]
+                            for d in dropped
+                            if d.get("reason", "").startswith("infeasible")})
+            reasons_block += (
+                f" Some named a primitive that CANNOT be written here "
+                f"({', '.join(named)}): there is no torch, tensorflow, sklearn "
+                f"or pandas, only numpy and lightgbm on one core. Name the numpy "
+                f"operations that implement your mechanism — array indexing, "
+                f"np.add.at, a matmul, a bincount, a searchsorted — or propose "
+                f"something else.")
+        if why.get("duplicate_family_in_batch"):
+            reasons_block += (
+                " Some declared a family another hypothesis in the same batch "
+                "had already claimed, which measures one idea several times.")
+        diag, hyp2 = _propose(refusal=(
+            f"All {len(hypotheses)} of your previous hypotheses were discarded "
+            f"without being run ({why_str}), so that ask measured nothing."
+            f"{reasons_block}"
+            + (f" The refuted families are: {', '.join(refuted_families)}."
+               if refuted_families else "")
+            + f" The legal families are: {', '.join(legal_families)} — where "
+              f"'{_OTHER_FAMILY}' means any mechanism matching none of the named "
+              f"families, which is always legal. Propose in a DIFFERENT family "
+              f"from the ones just refused, with an implementation you can name "
+              f"the numpy operations for."))
+        cands2, dropped2, rejects2 = _filter(diag, hyp2)
+        dropped += dropped2
+        rejects += rejects2
+        if cands2:
+            candidates = cands2
         else:
+            # It insisted twice. Emit ONE probation node rather than [], so the
+            # iteration measures something instead of closing a node. This
+            # re-tests a blocked family on purpose: the ban's unsound step is its
+            # RESOLUTION, not its measurement — `sequence_features` matches the
+            # bare token "sequence" and so covers DIN, target attention, history
+            # pooling and session features, none of which ever ran. A fresh
+            # member of the family is genuinely untested evidence, and measuring
+            # it beats measuring nothing.
+            probation = {
+                "reason": ("every hypothesis in this iteration was dropped by "
+                           "the dedup filter, twice"),
+                "blocked_families": blocked_now,
+                "note": ("emitted under probation to keep the iteration live; "
+                         "the family's evidence is a refutation of specific "
+                         "implementations, not of the family"),
+            }
+            candidates = [_node_for(diag, rejects[-1], probation=probation)]
             if verbose:
-                print(f"  diagnosis insisted on exhausted {named!r}; "
-                      f"falling back to {fallback!r}")
-            diag["exhaustion_fallback"] = {"refused": diag.get("component"),
-                                           "substituted": fallback}
-            diag["component"] = fallback
+                print(f"  proposer insisted on {', '.join(blocked_now)} twice — "
+                      f"emitting 1 probation node so the iteration still "
+                      f"measures something")
 
-    # Everything below reads diag["component"], so the substitution above has to
-    # land before this line — the writer is routed at the replacement, not at
-    # the component that was refused.
-    evidence_card = diag_llm.ground_in_literature(diag["bottleneck"])
-    counters.bump("tokens", 500)
-    hypotheses = diag_llm.generate_hypothesis(diag, evidence_card, tried=tried)
-    counters.bump("proposals", len(hypotheses))
-    counters.bump("tokens", 300 * len(hypotheses))
+    # Attached to the returned diagnosis, NOT to the candidate nodes: run()
+    # forwards it into the iteration record, and it has no business in the
+    # writer's prompt. Before this the drop left no node, no ledger entry and no
+    # log line — the only surviving evidence in the recorded run was the
+    # arithmetic gap between counters.proposals (8) and sum(n_candidates) (5).
+    if dropped:
+        diag["dropped_by_dedup"] = dropped
 
-    candidates: List[Node] = []
-    for h in hypotheses:
-        fp = _fingerprint(h)
-        # blocking_only: a family is retired only by a REFUTED verdict, not by
-        # any prior sighting. See Memory.is_duplicate — every scored candidate is
-        # recorded, most as `inconclusive`, so an unconditional match retired a
-        # family after one indecisive result even when the verdict step said
-        # retry_cheaper or build_on_it.
-        if memory.is_duplicate(fp, blocking_only=True):
-            continue
-        candidates.append(Node(
-            id=_new_id(), parent_id=parent.id, code_path=parent.code_path,
-            code_dir=parent.code_dir,
-            operation="improve",
-            diagnosis=diag, hypothesis=h,
-        ))
     if verbose:
-        print(f"  hypotheses={len(hypotheses)} candidates={len(candidates)}")
+        print(f"  hypotheses={len(hypotheses)} candidates={len(candidates)}"
+              f"{f' dropped_by_dedup={len(dropped)}' if dropped else ''}")
     return diag, candidates
 
 
@@ -1064,7 +1871,11 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         root_baseline_path: str | None = ROOT_BASELINE_PATH,
         confirm_baseline_path: str | None = CONFIRM_BASELINE_PATH,
         memory_path: str | None = None,
-        champion_dir: str | None = None):
+        champion_dir: str | None = None,
+        # Defaults to True because the failure it prevents is silent. Mocked runs
+        # and mocked tests are exempted automatically by _using_mocks(), so this
+        # costs them nothing and no test has to opt out.
+        require_real_models: bool = True):
     """`champion_dir` is a parameter rather than only the CHAMPION_DIR global
     for the same isolation reason progress_path and memory_path are: a mocked
     or tested run must not archive its candidates into the live
@@ -1081,12 +1892,26 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
     memory = Memory(path=memory_path) if memory_path else Memory()
     counters = Counters()
     t_start = time.time()
+    # The ledger is a PROCESS global, so a second run in the same process would
+    # otherwise inherit the first one's tokens and report a total that belongs to
+    # neither run.
+    _usage_ledger().reset()
 
     # nodes.jsonl is append-only within a run, so a fresh run must start clean
     # or its records interleave with the previous run's under the same iter
     # numbers. progress_path=None means "write nothing", log included.
     if progress_path and os.path.exists(NODES_LOG_PATH):
         os.remove(NODES_LOG_PATH)
+
+    # Model routing, reported once and then CHECKED. The check is not optional
+    # on a real run: a FakeBackend run produces canned gate-clean edits, scores
+    # them, promotes them and archives a champion, so nothing downstream can tell
+    # it from a real search. See FakeBackendInRealRunError.
+    model_report = _model_report()
+    if verbose:
+        _print_model_banner(model_report)
+    if require_real_models:
+        _require_real_models(model_report)
 
     root = _new_root()
     if verbose:
@@ -1139,12 +1964,19 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
     # nodes.jsonl, which records what was tried, not how it was scheduled.
     improves_since_refine = 0
 
+    # Run-wide failure digest, keyed on (file, exception, line). See
+    # FailureDigest: the two identical `encode` crashes in the recorded run were
+    # SIBLINGS, so the ancestor chain structurally could not show either one the
+    # other's traceback.
+    digest = FailureDigest()
+
     # Diff-hash dedup — spans the whole run, not just one iteration. Prevents
     # burning execute calls on codegen outputs we've already tried.
     seen_diff_hashes: set = set()
 
     def _record_iteration(it: int, candidates: List[Node], promoted_ids: List[str],
-                          global_best_at_start: float) -> None:
+                          global_best_at_start: float,
+                          dropped_by_dedup: List[dict] | None = None) -> None:
         """Snapshot this iteration's scores, print them, rewrite the progress file.
 
         curr_vs_baseline is measured against the champion as it stood when the
@@ -1152,7 +1984,6 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         actually promoted report a delta of +0.000000, since the candidate had
         just become the thing it was being compared to.
         """
-        nonlocal iter_history
         pairs = [(c, _scalar_primary(c)) for c in candidates]
         scored = [(c, s) for c, s in pairs if s > float("-inf")]
         best_node, iter_primary = max(scored, key=lambda cs: cs[1],
@@ -1193,8 +2024,24 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             "best_mean_delta_node": best_delta_node.id if best_delta_node else None,
             "n_candidates": len(candidates),
             "n_scored": len(scored),
+            # The adaptive triage cap this iteration actually used, and the
+            # parent runtime it was derived from. A cap that does not appear in
+            # the log cannot be told from a timeout that was the mechanism's
+            # fault.
+            "triage_cap_s": _triage_cap_for(parent) if parent else None,
+            "parent_clean_runtime_s": (round(parent.clean_runtime_s, 2)
+                                       if parent is not None
+                                       and parent.clean_runtime_s else None),
             "n_open_nodes": len(open_nodes),
             "promoted": promoted_ids,
+            # The widening event, per iteration. Section 2.5 of the problem
+            # statement requires per-iteration error and recovery events, and a
+            # dedup drop is both: it is why an iteration produced fewer
+            # candidates than proposals, and the re-ask is the recovery. Without
+            # it an iteration recording n_candidates=0 gives a reader no way to
+            # tell starvation from a proposer that returned nothing.
+            "dropped_by_dedup": dropped_by_dedup or [],
+            "dedup_starved": counters.dedup_starved,
             # Every candidate, not just the scored ones: when iter_primary is
             # null it's the unscored candidates' evidence_type that says why.
             # n_seeds is here because a 1-seed and a 3-seed primary are not the
@@ -1202,12 +2049,23 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             "candidates": [{"id": c.id,
                             "primary": s if s > float("-inf") else None,
                             "n_seeds": len(c.per_seed_primary),
+                            # Section 2.5 requires per-iteration GAUC / nDCG@5
+                            # in the submitted run log, which a primary-only
+                            # schema could not produce.
+                            "GAUC": _mean_metric(c.per_seed_gauc),
+                            "nDCG@5": _mean_metric(c.per_seed_ndcg5),
+                            "per_seed_gauc": dict(c.per_seed_gauc),
+                            "per_seed_ndcg5": dict(c.per_seed_ndcg5),
                             "mean_delta": c.mean_delta,
                             "p_positive": c.p_positive,
                             "lower_95": c.lower_95,
                             "confirm_primary": c.confirm_primary,
+                            "permuted_primary": c.permuted_primary,
                             "status": c.status,
                             "evidence_type": c.evidence_type} for c, s in pairs],
+            # The best candidate's two metrics and each one's distance to its OWN
+            # ceiling, which is where the headroom actually is.
+            "iter_metrics": _metric_block(best_node) if best_node else None,
         })
 
         if verbose:
@@ -1237,11 +2095,24 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         if progress_path:
             _append_nodes_log(candidates, iter_no=it)
 
+        # Real numbers, refreshed BEFORE the write rather than after the loop.
+        # wallclock_s was assigned once, after the loop that writes this file, so
+        # every persisted progress.json reports 0.0 — and `tokens` was
+        # hand-incremented constants totalling a fabricated 13200. Both are what
+        # Feasibility & Practicality is scored on.
+        counters.wallclock_s = time.time() - t_start
+        counters.sync_usage(_usage_ledger())
+
         if progress_path:
             _write_json_atomic(progress_path, {
                 "updated_at": time.time(),
                 "metric": "primary = (GAUC + nDCG@5) / 2 on valid_search",
                 "baseline_primary": root.local_best_score,
+                # The baseline's own two metrics, so every candidate's per-metric
+                # numbers in `iterations` have something to be read against.
+                "baseline_metrics": _metric_block(root),
+                "metric_ceilings": {"GAUC": GAUC_CEILING,
+                                    "nDCG@5": NDCG5_CEILING},
                 # False means the root has no per-user data, so no candidate can
                 # pass should_continue_locally and the tree stays flat.
                 "root_measured": root_measured,
@@ -1250,6 +2121,14 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 "history": list(history),
                 "iter_history": list(iter_history),
                 "counters": asdict(counters),
+                # Failure signatures seen MORE THAN ONCE. A signature seen
+                # once is a bug; seen three times it is a systematic gap in what
+                # the writer is being told, and that is the actionable read.
+                "repeated_failures": digest.summary(),
+                # Which models actually served this run, and the backend that
+                # served them. Without it a reader cannot tell a real run from a
+                # FakeBackend run, and cannot interpret the cost figures.
+                "models": model_report,
                 "iterations": iter_records,
             })
 
@@ -1271,6 +2150,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                   f"current_best={iter_history[-1]:.4f} "
                   f"baseline={root.local_best_score:.4f} "
                   f"elapsed={elapsed:.0f}s")
+
+        # The liveness invariant, asserted rather than described. It was already
+        # stated in prose on the prune path below and held on only ONE of the two
+        # paths that can remove a node, which is how iteration 4 of the recorded
+        # run reached `n_open_nodes=0` and had "global convergence" declared over
+        # it. Both removal paths now satisfy this.
+        assert open_nodes, "frontier emptied — liveness invariant violated"
 
         if elapsed > wallclock_cap_s:
             if verbose:
@@ -1364,7 +2250,6 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                                         list(iter_history), recent_improvement,
                                         prior_refines)
                 counters.bump("proposals")
-                counters.bump("tokens", 800)
                 diag = {"component": component,
                         "bottleneck": f"weakest by ablation: {component}",
                         "ablation_deltas": ablations,
@@ -1401,12 +2286,33 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         all_nodes.extend(candidates)
 
         if not candidates:
-            parent.status = "closed"
-            parent.evidence_type = "invariant"
-            if parent in open_nodes:
-                open_nodes.remove(parent)
+            # The ROOT is never closed and never leaves the frontier.
+            #
+            # orchestrator/selection.py::select raises RuntimeError on an empty
+            # list, so before this guard the only thing between the run and a
+            # crash was that global_should_stop (convergence.py) reached the
+            # empty frontier first and called it convergence. Fixing the stop
+            # condition alone would therefore convert a false convergence into a
+            # crash, which is why the guarantee has to live at the frontier
+            # instead.
+            #
+            # Nothing anywhere re-opens a closed node — open_nodes.append
+            # appears exactly once in this module, on the parent-acceptance
+            # path — so the frontier is a ratchet and needs an explicit floor.
+            # The prune path below already has this guard; this was the other of
+            # the two paths that can remove a node, and it did not.
+            if parent is not root:
+                parent.status = "closed"
+                parent.evidence_type = "invariant"
+                if parent in open_nodes:
+                    open_nodes.remove(parent)
+            elif verbose:
+                print("  parent is the root — kept on the frontier "
+                      "(liveness floor)")
             # Record even here, so dedup-only iterations aren't a gap in the file.
-            _record_iteration(it, [], promoted_ids, global_best_at_start)
+            _record_iteration(it, [], promoted_ids, global_best_at_start,
+                              dropped_by_dedup=(diag or {}).get(
+                                  "dropped_by_dedup"))
             continue
 
         # 3. write → diff-hash dedup → gate (hard) → audit (advisory) → partial run
@@ -1417,6 +2323,9 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             re-written once with that fact fed back, instead of being recorded as
             a refuted mechanism it never actually implemented.
             """
+            # Per-attempt, not per-node: a no-op rewrite gets a fresh smoke
+            # budget because it is a different piece of code.
+            smoke_fixes = 0
             if c.operation == "refine":
                 # Route through the registry so the component name resolves to
                 # the file it actually lives in. "capacity" and
@@ -1431,7 +2340,6 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                                          target_component=diag["component"],
                                          root=parent.code_dir,
                                          semantic_feedback=semantic_feedback)
-            counters.bump("tokens", 800)
 
             # Diff-hash dedup: skip if this exact diff has already been tried.
             dh = _diff_hash(diff)
@@ -1459,7 +2367,6 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             audit_res = llm.audit(diff, checklist={
                 "test_label_access": True, "external_data_rule": True,
                 "temporal_causality": True, "same_row_auxiliary_as_input": True})
-            counters.bump("tokens", 400)
             if not audit_res["pass"]:
                 c.diagnosis = {**(c.diagnosis or {}),
                                "audit_concerns": audit_res.get("violations", [])}
@@ -1478,12 +2385,81 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             c.code_dir = cand_dir
             c.code_path = os.path.join(cand_dir, "baseline.py")
 
-            # 3a. Triage run — one seed, short cap.
+            # 3a. SMOKE STAGE — the real candidate contract on 200 synthetic
+            # rows, in well under a second. Every execution failure in the
+            # recorded run was detectable here: a shape mismatch, an IndexError
+            # in encode(), and a mechanism whose per-row cost was immediately
+            # obvious. Those cost 240s each plus up to two further 240s repair
+            # runs, so one bad edit could burn 12 minutes to learn what this
+            # says instantly.
+            #
+            # Because the signal is nearly free, the repair budget here is
+            # MAX_SMOKE_FIX_ATTEMPTS (5) rather than MAX_FIX_ATTEMPTS (2): more
+            # attempts at no extra cost, and only code already proven to RUN
+            # ever reaches the expensive path below.
+            smoke = codegen.smoke_check(cand_dir)
+            counters.bump("smoke_runs")
+            while not smoke["ok"] and smoke_fixes < MAX_SMOKE_FIX_ATTEMPTS:
+                smoke_fixes += 1
+                c.fix_attempts += 1
+                c.last_error_excerpt = smoke["error"][-ANCESTOR_ERROR_CHARS:]
+                if verbose:
+                    print(f"  {c.id} smoke failed at {smoke.get('stage')!r} in "
+                          f"{smoke.get('seconds', 0):.2f}s — repair "
+                          f"{smoke_fixes}/{MAX_SMOKE_FIX_ATTEMPTS}")
+                _sig = digest.record(
+                    smoke["error"], node_id=c.id,
+                    mechanism=(c.hypothesis or {}).get("mechanism"),
+                    stage="smoke")
+                repair = codegen.debug_and_retry(
+                    c.code_path, smoke["error"], root=cand_dir,
+                    hypothesis=c.hypothesis,
+                    ancestors=_ancestor_chain(c, all_nodes),
+                    prior_failures=digest.matching(smoke["error"],
+                                                   exclude_node=c.id))
+                if repair.get("is_semantic_change"):
+                    counters.bump("semantic_retries")
+                repair_diff = (repair.get("code_diff") or "").strip()
+                if not repair_diff:
+                    break
+                digest.note_repair(_sig, node_id=c.id, diff=repair_diff)
+                pre_hash = _dir_sha256(cand_dir)
+                if not _apply_diff_to_dir(repair_diff, cand_dir):
+                    break
+                if _dir_sha256(cand_dir) == pre_hash:
+                    break
+                smoke = codegen.smoke_check(cand_dir)
+                counters.bump("smoke_runs")
+                # Whether THIS repair worked is the field that makes the digest
+                # worth more than a list of tracebacks: "three candidates hit
+                # this and none of the repairs worked" is actionable.
+                digest.resolve(_sig, node_id=c.id, repaired=smoke["ok"])
+            if not smoke["ok"]:
+                counters.bump("smoke_rejects")
+                # Never reaches codegen.execute. This is the whole point: the
+                # 240s triage run is not spent on code that cannot survive 200
+                # rows.
+                c.last_error_excerpt = smoke["error"][-ANCESTOR_ERROR_CHARS:]
+                if verbose:
+                    print(f"  {c.id} rejected by smoke at "
+                          f"{smoke.get('stage')!r} after {smoke_fixes} repair "
+                          f"attempt(s); no triage run spent")
+                return "smoke"
+            if smoke_fixes and verbose:
+                print(f"  {c.id} smoke clean after {smoke_fixes} repair "
+                      f"attempt(s) ({smoke.get('seconds', 0):.2f}s)")
+
+            # 3b. Triage run — one seed, cap scaled off the PARENT's own cost.
+            triage_cap = _triage_cap_for(parent)
+            _t_triage = time.time()
             res = codegen.execute(c.code_path, seed=0, split="valid_search",
-                                  wallclock_cap_seconds=TRIAGE_WALLCLOCK_CAP_S,
+                                  wallclock_cap_seconds=triage_cap,
                                   root=cand_dir, data_dir=DATA_DIR)
             counters.bump("triage_runs")
             counters.bump_scorer("valid_search")
+            if res["status"] == "ok":
+                # Measured, so this node's own children get a cap scaled off it.
+                c.clean_runtime_s = time.time() - _t_triage
 
             # Record HOW it failed before repairing, so this node's own chain
             # entry is informative to its descendants even if every repair
@@ -1492,16 +2468,28 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             if res["status"] != "ok":
                 c.last_error_excerpt = (res.get("logs") or "")[-ANCESTOR_ERROR_CHARS:]
 
-            while res["status"] != "ok" and c.fix_attempts < MAX_FIX_ATTEMPTS:
+            # The EXECUTION repair budget stays at MAX_FIX_ATTEMPTS. Measured
+            # from wherever the smoke repairs left c.fix_attempts, so a
+            # candidate that needed 5 cheap repairs still gets its 2 expensive
+            # ones — the two budgets buy different things and must not share a
+            # counter.
+            exec_fix_ceiling = c.fix_attempts + MAX_FIX_ATTEMPTS
+            while res["status"] != "ok" and c.fix_attempts < exec_fix_ceiling:
                 c.fix_attempts += 1
                 # hypothesis and ancestors: without them the repair model saw a
                 # traceback and a file, with no idea what the edit was trying to
                 # do or that its ancestors had already failed the same way. This
                 # operator handled 6 of the 11 candidates in the recorded run.
+                _sig = digest.record(
+                    res["logs"], node_id=c.id,
+                    mechanism=(c.hypothesis or {}).get("mechanism"),
+                    stage="execute")
                 repair = codegen.debug_and_retry(
                     c.code_path, res["logs"], root=cand_dir,
                     hypothesis=c.hypothesis,
-                    ancestors=_ancestor_chain(c, all_nodes))
+                    ancestors=_ancestor_chain(c, all_nodes),
+                    prior_failures=digest.matching(res["logs"],
+                                                   exclude_node=c.id))
                 if repair.get("is_semantic_change"):
                     counters.bump("semantic_retries")
                 repair_diff = (repair.get("code_diff") or "").strip()
@@ -1515,14 +2503,20 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                     # failure mode when the diff targeted the wrong path or had
                     # only empty hunks.
                     break
+                digest.note_repair(_sig, node_id=c.id, diff=repair_diff)
+                _t_triage = time.time()
                 res = codegen.execute(c.code_path, seed=0, split="valid_search",
-                                      wallclock_cap_seconds=TRIAGE_WALLCLOCK_CAP_S,
+                                      wallclock_cap_seconds=triage_cap,
                                       root=cand_dir, data_dir=DATA_DIR)
                 counters.bump("triage_runs")
                 counters.bump_scorer("valid_search")
+                if res["status"] == "ok":
+                    c.clean_runtime_s = time.time() - _t_triage
                 # Keep the excerpt on the LAST failure, not the first: after a
                 # repair the crash is usually somewhere else, and that later
                 # error is the one a descendant needs to avoid.
+                digest.resolve(_sig, node_id=c.id,
+                               repaired=res["status"] == "ok")
                 if res["status"] != "ok":
                     c.last_error_excerpt = (
                         res.get("logs") or "")[-ANCESTOR_ERROR_CHARS:]
@@ -1533,7 +2527,9 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 # inner loop), not for abandoning the hypothesis — so it must not
                 # be filed as a failed implementation.
                 if verbose:
-                    print(f"  {c.id} timed out at {TRIAGE_WALLCLOCK_CAP_S}s "
+                    print(f"  {c.id} timed out at {triage_cap}s "
+                          f"(4x parent runtime "
+                          f"{getattr(parent, 'clean_runtime_s', None)}, clamped) "
                           f"(after {c.fix_attempts} repair attempt(s))")
                 return "timeout"
             if res["status"] != "ok":
@@ -1544,8 +2540,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             # working ancestor is broken.
             c.last_error_excerpt = None
             c.partial_scores.append(res["metrics"]["primary"])
-            c.per_seed_primary[0] = res["metrics"]["primary"]
-            c.per_user_by_seed[0] = res["metrics"].get("per_user", {})
+            _record_metrics(c, 0, res["metrics"])
             return "ok"
 
         #: How a failed _attempt is recorded. A no-op is NOT one of these — it
@@ -1555,6 +2550,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                              "gate": "failed_implementation",
                              "patch": "failed_implementation",
                              "exec": "failed_implementation",
+                             # Failed the 200-row smoke stage after
+                             # MAX_SMOKE_FIX_ATTEMPTS repairs, so it never
+                             # reached a triage run. Same class as "exec" — the
+                             # writer could not implement it — and deliberately
+                             # NOT a statement about the mechanism.
+                             "smoke": "failed_implementation",
                              # Ran, but not inside TRIAGE_WALLCLOCK_CAP_S. Its own
                              # type so the per-iteration tally in
                              # _record_iteration distinguishes "the writer can't
@@ -1574,6 +2575,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 counters.bump("no_op_rewrites")
                 c.partial_scores.clear()
                 c.per_seed_primary.clear()
+                c.per_seed_gauc.clear()
+                c.per_seed_ndcg5.clear()
                 c.per_user_by_seed.clear()
                 outcome = _attempt(c, semantic_feedback=codegen.NO_SEMANTIC_CHANGE)
                 if outcome == "ok" and _is_no_op(c, parent, seed=0):
@@ -1600,14 +2603,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             cand_dir = os.path.dirname(c.code_path)
             for seed in (1, 2):
                 r = codegen.execute(c.code_path, seed=seed, split="valid_search",
-                                    wallclock_cap_seconds=600,
+                                    wallclock_cap_seconds=FULL_RUN_WALLCLOCK_CAP_S,
                                     root=cand_dir, data_dir=DATA_DIR)
                 counters.bump("full_runs")
                 counters.bump_scorer("valid_search")
                 if r["status"] == "ok":
                     c.seeds_run.append(seed)
-                    c.per_seed_primary[seed] = r["metrics"]["primary"]
-                    c.per_user_by_seed[seed] = r["metrics"].get("per_user", {})
+                    _record_metrics(c, seed, r["metrics"])
             c.local_best_score = _scalar_primary(c)
 
             mean_d, p_pos, lower_95 = bootstrap_delta(
@@ -1658,7 +2660,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             if (p_pos >= PROMOTE_TRIGGER_P_POS and lower_95 > 0
                     and c.local_best_score > global_best):
                 r_conf = codegen.execute(c.code_path, seed=0, split="valid_confirm",
-                                         wallclock_cap_seconds=600,
+                                         wallclock_cap_seconds=FULL_RUN_WALLCLOCK_CAP_S,
                                          root=cand_dir, data_dir=DATA_DIR)
                 counters.bump_scorer("valid_confirm")
                 if r_conf["status"] == "ok":
@@ -1674,7 +2676,21 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                     conf_mean, _conf_p, conf_lower = bootstrap_delta(
                         {0: r_conf["metrics"].get("per_user", {})},
                         confirm_baseline)
-                    if should_promote_globally(conf_mean, conf_lower):
+                    # LEAK CONTROLS, checked before the promotion is accepted.
+                    # Both cost nothing when the candidate is clean, and a
+                    # promotion is the ONE place worth paying for certainty: it
+                    # is what a submission gets generated from.
+                    leak = _leak_check(
+                        c, cand_dir, counters,
+                        confirm_primary=c.confirm_primary,
+                        history=history, verbose=verbose)
+                    if leak:
+                        c.status = "closed"
+                        c.evidence_type = "leak_suspected"
+                        c.verdict_reason = leak
+                        if verbose:
+                            print(f"  {c.id} PROMOTION REFUSED — {leak}")
+                    elif should_promote_globally(conf_mean, conf_lower):
                         c.status = "promoted"
                         c.evidence_type = "invariant"
                         # global_best stays on valid_search — the currency the
@@ -1732,7 +2748,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                     n.evidence_type = n.evidence_type or "inconclusive"
             open_nodes = keep
 
-        _record_iteration(it, candidates, promoted_ids, global_best_at_start)
+        _record_iteration(it, candidates, promoted_ids, global_best_at_start,
+                          dropped_by_dedup=(diag or {}).get("dropped_by_dedup"))
 
         # iter_history, not history: `history` only grows on promotion, so it
         # is almost always shorter than local_plateau()'s N+1 minimum and the
@@ -1746,7 +2763,10 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                       f"{PLATEAU_STOP_WINDOW_N} iterations)")
             break
 
+    # Kept, as the authoritative end-of-run values. _record_iteration also writes
+    # both per iteration so a killed run still leaves real numbers.
     counters.wallclock_s = time.time() - t_start
+    counters.sync_usage(_usage_ledger())
     if verbose:
         print(f"\n[champion] {champion.id} primary={champion_primary:.4f} "
               f"({champion_primary - root.local_best_score:+.4f} vs baseline)"
@@ -1762,8 +2782,12 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
     scored_iters = [r for r in iter_records if r["iter_primary"] is not None]
     best_iter = max(scored_iters, key=lambda r: r["iter_primary"], default=None)
 
-    return {"global_best": global_best,
+    result = {"global_best": global_best,
             "global_best_node_id": global_best_node.id,
+            # Per-metric, for print_final_summary. A scalar primary cannot say
+            # which of the two halves a run actually moved.
+            "champion_metrics": _metric_block(champion),
+            "baseline_metrics": _metric_block(root),
             # The greedy best, which is what a submission should be generated
             # from when nothing cleared the sealed-split promotion gate.
             "champion_primary": champion_primary,
@@ -1777,6 +2801,53 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             "iters_completed": len(iter_records),
             "history": history,
             "counters": counters}
+
+    # The write-up, from the run's own record rather than from memory. Written
+    # only when this run persists state at all (progress_path=None means "write
+    # nothing"), and never allowed to fail the run: a report is the last thing
+    # that happens and losing it must not lose the numbers.
+    if progress_path:
+        try:
+            report = codegen.synthesize_report({
+                "task": "KuaiRand-Pure within-user ranking (TechJam Track 2)",
+                "baseline_primary": root.local_best_score,
+                "baseline_metrics": _metric_block(root),
+                "metric_ceilings": {"GAUC": GAUC_CEILING,
+                                    "nDCG@5": NDCG5_CEILING},
+                "global_best": {"node_id": global_best_node.id,
+                                "primary": global_best,
+                                "mechanism": (global_best_node.hypothesis
+                                              or {}).get("mechanism"),
+                                "split": "valid_confirm"},
+                "champion": {"node_id": champion.id,
+                             "primary": champion_primary,
+                             "is_baseline": champion is root,
+                             "mechanism": (champion.hypothesis
+                                           or {}).get("mechanism"),
+                             "metrics": _metric_block(champion)},
+                "promotions": max(len(history) - 1, 0),
+                "iters_completed": len(iter_records),
+                "counters": asdict(counters),
+                "models": model_report,
+                "repeated_failures": digest.summary(),
+                "iterations": iter_records,
+            })
+            # Beside progress.json, NOT at the module-global path: a mocked run
+            # and every driver-level test pass their own progress_path, and a
+            # fixed global would have them all overwrite the live
+            # orchestrator/_state/report.md — the same isolation trap
+            # champion_dir already documents.
+            report_path = os.path.join(
+                os.path.dirname(progress_path) or ".",
+                os.path.basename(REPORT_PATH))
+            _write_text_atomic(report_path, report)
+            if verbose:
+                print(f"[report] written to {report_path}")
+        except Exception as e:                      # noqa: BLE001 — see above
+            if verbose:
+                print(f"[report] unavailable ({type(e).__name__}: {e})")
+
+    return result
 
 
 def print_final_summary(result: dict) -> None:
@@ -1820,18 +2891,72 @@ def print_final_summary(result: dict) -> None:
               f"node {result.get('best_valid_search_node_id')}) — "
               f"did not survive promotion")
 
+    # Both metrics, with each one's own remaining headroom. The primary averages
+    # two quantities whose ceilings differ (GAUC 1.0, nDCG@5 0.7289), so a run
+    # reported only as a primary cannot say which half it moved or which half
+    # still has room.
+    champ_m = result.get("champion_metrics") or {}
+    base_m = result.get("baseline_metrics") or {}
+    if champ_m.get("GAUC") is not None or base_m.get("GAUC") is not None:
+        print("per-metric:")
+        for name, ceiling in (("GAUC", GAUC_CEILING), ("nDCG@5", NDCG5_CEILING)):
+            cv, bv = champ_m.get(name), base_m.get(name)
+            if cv is None and bv is None:
+                continue
+            line = f"  {name:8s}"
+            if bv is not None:
+                line += f" baseline {bv:.4f}"
+            if cv is not None:
+                line += f"  champion {cv:.4f}"
+                if bv is not None:
+                    line += f"  ({cv - bv:+.4f})"
+                line += f"  {ceiling - cv:.4f} to ceiling {ceiling}"
+            elif bv is not None:
+                line += f"  {ceiling - bv:.4f} to ceiling {ceiling}"
+            print(line)
+
     promotions = max(len(result.get("history") or []) - 1, 0)
     print(f"iterations: {result.get('iters_completed', '?')} | "
           f"promotions: {promotions}")
 
     c = result["counters"]
     print("counters:")
+    by_kind = None
     for field, value in asdict(c).items():
+        if field == "tokens_by_kind":
+            by_kind = value            # printed as its own block below
+            continue
         if isinstance(value, dict):
             value = "  ".join(f"{k}={v}" for k, v in value.items())
+        elif field == "estimated_cost_usd":
+            value = f"${value:.2f} (estimate — see llm_calls/usage.py)"
+        elif field == "wallclock_s":
+            # Enough precision that a fast mocked run reads as 0.03s rather than
+            # as "0.0", which is indistinguishable from the pre-T2.3 bug where
+            # this field was never written at all.
+            value = (f"{value:.2f}" if value < 10 else
+                     f"{value:.0f}  ({value / 60:.1f} min)")
         elif isinstance(value, float):
             value = f"{value:.1f}"
-        print(f"  {field:18s} {value}")
+        print(f"  {field:22s} {value}")
+
+    # The per-operator breakdown, which is the actionable half. A single scalar
+    # cannot show that the writer reproduces a whole file at the output rate
+    # while the auditor burns input tokens for a signal that fired on 5 of 5.
+    if by_kind:
+        print("tokens by operator:")
+        rows = sorted(by_kind.items(),
+                      key=lambda kv: -kv[1].get("estimated_cost_usd", 0))
+        for kind, u in rows:
+            print(f"  {kind:14s} calls={u.get('calls', 0):4d} "
+                  f"in={u.get('tokens_in', 0):8d} "
+                  f"(cached {u.get('tokens_cached', 0):7d}) "
+                  f"out={u.get('tokens_out', 0):7d} "
+                  f"reasoning={u.get('tokens_reasoning', 0):7d} "
+                  f"~${u.get('estimated_cost_usd', 0):.3f}")
+        if c.calls_without_usage:
+            print(f"  NOTE: {c.calls_without_usage} call(s) reported no usage "
+                  f"block, so these totals are an undercount")
 
 
 if __name__ == "__main__":
@@ -1841,9 +2966,77 @@ if __name__ == "__main__":
     ap.add_argument("--max-iters", type=int, default=5)
     ap.add_argument("--show-diffs", action="store_true",
                     help="print each generated diff (verbose, useful for debugging)")
+    ap.add_argument("--check-models", action="store_true",
+                    help="print the resolved model routing and exit. Non-zero "
+                         "exit if a real run would fall back to FakeBackend. "
+                         "Makes no API call.")
+    ap.add_argument("--check-schemas", action="store_true",
+                    help="make ONE minimal real API call per enforced JSON "
+                         "schema and exit non-zero if any is rejected. Costs a "
+                         "few cents; catches a 400 that would otherwise surface "
+                         "several paid calls into a run.")
     args = ap.parse_args()
 
     SHOW_DIFFS = args.show_diffs
+
+    if args.check_models:
+        # Deliberately BEFORE the --mock swap, so this reports what a REAL run
+        # would use. Costs no API call: the backends are constructed but never
+        # invoked, which is exactly the check — OpenAIBackend's constructor is
+        # what validates the key and the SDK import.
+        _rep = _model_report()
+        _print_model_banner(_rep)
+        try:
+            _require_real_models(_rep)
+        except FakeBackendInRealRunError as e:
+            print(f"\n[check-models] FAIL: {e}")
+            raise SystemExit(1)
+        print("\n[check-models] OK: a real run would call real models.")
+        raise SystemExit(0)
+
+    if args.check_schemas:
+        # ONE minimal real call per enforced schema, to prove the API accepts
+        # them. Exists because a malformed `strict` schema is a 400 at the FIRST
+        # call that uses it — and in the real driver that lands several paid
+        # calls into a run, after the baseline measurement, diagnose and
+        # literature grounding have already been spent. A root-array schema cost
+        # exactly that. Structural tests catch the known rules
+        # (tests/test_model_routing.py); only the API can confirm the rest.
+        #
+        # Deliberately opt-in and deliberately tiny: a handful of ~50-token
+        # calls, no search tool, effort "none" where the model allows it.
+        from llm_calls import client as _lc
+        from llm_calls.schemas import (DIAGNOSIS_JSON_SCHEMA,
+                                       VERDICT_JSON_SCHEMA,
+                                       hypothesis_json_schema)
+        _rep = _model_report()
+        _print_model_banner(_rep)
+        _require_real_models(_rep)
+        _cases = [("diagnosis", DIAGNOSIS_JSON_SCHEMA),
+                  ("verdict", VERDICT_JSON_SCHEMA),
+                  ("hypotheses", hypothesis_json_schema()),
+                  ("hypotheses (narrowed)",
+                   hypothesis_json_schema(["bpr_pairwise"]))]
+        print(f"\n[check-schemas] {len(_cases)} minimal live calls ...")
+        _failed = []
+        for _name, _schema in _cases:
+            try:
+                _lc.call_model_text(
+                    "Return the smallest valid object for the given schema.",
+                    "Fill every required field with a short placeholder.",
+                    max_tokens=2000, effort="none", kind="schema_check",
+                    text_format=_schema)
+                print(f"  OK    {_name}")
+            except Exception as e:                 # noqa: BLE001
+                _failed.append((_name, e))
+                print(f"  FAIL  {_name}: {type(e).__name__}: "
+                      f"{str(e)[:300]}")
+        if _failed:
+            print(f"\n[check-schemas] {len(_failed)} schema(s) rejected — a real "
+                  f"run would crash at the first call using them.")
+            raise SystemExit(1)
+        print("\n[check-schemas] OK: every enforced schema is accepted.")
+        raise SystemExit(0)
 
     run_kwargs = {}
     if args.mock:

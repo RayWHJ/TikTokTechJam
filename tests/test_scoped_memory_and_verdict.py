@@ -265,19 +265,51 @@ def test_a_small_positive_delta_is_not_recorded_as_refuted():
     assert ctx["paired_noise_floor"] == 0.0012
 
 
-def test_verdict_tokens_are_charged_only_on_success():
+def test_the_verdict_never_fabricates_a_token_count():
+    """This used to assert `counters.tokens == driver.VERDICT_TOKENS`, i.e. that
+    a verdict charged a hard-coded 400 tokens.
+
+    T2.3 removed every such constant. `tokens: 13200` in the persisted
+    progress.json was the sum of these guesses and no API ever reported it, while
+    the numbers are exactly what Feasibility & Practicality is scored on. Token
+    accounting now happens where the raw API response is visible — the client
+    layer — so a grader with no API call behind it must charge NOTHING, on
+    success as well as on failure.
+    """
     root, c = _scored(0.000593)
     counters = driver.Counters()
+
     driver._apply_verdict(c, root, root, _FakeVerdictLLM(RuntimeError("api down")),
                           counters, verbose=False)
     assert counters.tokens == 0
+
     driver._apply_verdict(c, root, root,
                           _FakeVerdictLLM({"verdict": "met",
                                            "criterion_was_calibrated": True,
                                            "reason": "ok",
                                            "next_action": "build_on_it"}),
                           counters, verbose=False)
-    assert counters.tokens == driver.VERDICT_TOKENS
+    assert c.verdict == "met", "the verdict itself must still be applied"
+    assert counters.tokens == 0, (
+        "a fake grader made no API call, so there is nothing to charge; a "
+        "non-zero count here would be a guess re-entering the report")
+    assert not hasattr(driver, "VERDICT_TOKENS"), \
+        "the fabricated per-verdict constant must be gone, not just unused"
+
+
+def test_no_token_count_in_the_driver_is_hand_incremented():
+    """The class fix behind T2.3, pinned so a constant cannot creep back.
+
+    Eight call sites used to bump `tokens` by a guessed constant (500 a
+    diagnose, 300 a hypothesis, 800 a writer call, 400 an audit). Real usage now
+    comes off `resp.usage` via llm_calls.usage.LEDGER.
+    """
+    import inspect
+    src = inspect.getsource(driver)
+    assert 'bump("tokens"' not in src, \
+        "a hand-incremented token count is back in driver.py"
+    assert "sync_usage" in src, \
+        "the driver must pull real usage off the ledger"
 
 
 def test_a_failed_grader_never_loses_a_scored_candidate():
@@ -406,3 +438,140 @@ def test_mocked_run_writes_verdicts_and_error_excerpts_to_nodes_log(
                                     "not_tested")
             assert n["next_action"] in ("retry_cheaper", "adjust_magnitude",
                                         "abandon_mechanism", "build_on_it")
+
+
+# --------------------------------------------------------------------------- #
+#  Bans are RUN-SCOPED (T1.4, corrected after the T2.7 interaction)           #
+# --------------------------------------------------------------------------- #
+#: The measurement that forced this rule. T2.7 widened each iteration from 1
+#: proposal to 6-8 with up to 4 executed, which multiplies the number of SCORED
+#: candidates per iteration — and every non-positive paired delta earns
+#: `abandon_mechanism` -> `refuted_under_context`. Under a bar of "two
+#: independent refutations, whenever measured", ONE fresh 8-iteration mocked run
+#: wrote 28 entries and left 7 of 13 families hard-blocked for the NEXT run, with
+#: 5 more on probation. A third run would start with almost nothing legal.
+#:
+#: That is the starvation this store was rewritten to prevent, one level up.
+#: Liveness held (the frontier floor and the probation node saw to that), but the
+#: proposal space collapsed run over run — which makes the search progressively
+#: unable to measure anything new.
+_FP = ("mechanism_family", "bpr_pairwise", "", "")
+
+
+def _ref(code_hash, seed_count=3):
+    return EvidenceEntry(
+        fingerprint=_FP, architecture="FM", loss="bpr", sampler="uniform",
+        split="valid_search", seed_count=seed_count, confidence_interval=None,
+        code_hash=code_hash, evidence_type="refuted_under_context",
+        note="fairly measured and negative")
+
+
+def test_two_refutations_from_this_run_still_block(tmp_path):
+    """The fix must not defang the ban. Within one run, corroborated evidence is
+    still a hard block — that is what stops the search re-testing a family it has
+    already measured twice."""
+    m = Memory(path=str(tmp_path / "m.json"))
+    assert not m.is_blocked(_FP)
+    m.record(_ref("c1"))
+    assert not m.is_blocked(_FP), "one refutation is probation"
+    m.record(_ref("c2"))
+    assert m.is_blocked(_FP), "two from THIS run must block"
+
+
+def test_a_ban_inherited_from_a_previous_run_is_probation_not_a_filter(tmp_path):
+    """THE fix. A new process gets a new run_id, so evidence written by an earlier
+    run no longer blocks on its own — it is rendered into the prompt as a
+    discount instead, exactly as a single refutation already was."""
+    path = str(tmp_path / "m.json")
+
+    run1 = Memory(path=path)
+    run1.record(_ref("c1"))
+    run1.record(_ref("c2"))
+    assert run1.is_blocked(_FP)
+
+    run2 = Memory(path=path)                 # new process, same file
+    assert run2.run_id != run1.run_id
+    assert not run2.is_blocked(_FP), \
+        "a second run must not start with the first run's families retired"
+    assert "bpr_pairwise" in run2.probationary_families(), \
+        "the evidence must still be VISIBLE to the proposer, just not enforced"
+
+
+def test_the_inherited_evidence_is_not_discarded_only_deferred(tmp_path):
+    """Prior measurements still count. ONE corroborating result from the current
+    run re-establishes the block, so a family that really is dead is re-retired
+    after a single cheap negative rather than needing two all over again."""
+    path = str(tmp_path / "m.json")
+    run1 = Memory(path=path)
+    run1.record(_ref("c1"))
+    run1.record(_ref("c2"))
+
+    run2 = Memory(path=path)
+    assert not run2.is_blocked(_FP)
+    run2.record(_ref("c3"))                  # one fresh negative measurement
+    assert run2.is_blocked(_FP), \
+        "inherited evidence plus one current-run refutation must block"
+
+
+def test_a_preseed_still_blocks_on_its_own_across_runs(tmp_path):
+    """The corroboration bar guards against ONE RUN's noisy verdict. A curated
+    measured fact is not that, so it is exempt — otherwise the four hand-authored
+    dead ends would silently reopen on every new process."""
+    m = Memory(path=str(tmp_path / "m.json"))
+    cwm = ("pointwise_logloss", "uniform", "cwm_13field", "pure")
+    for fp in [cwm,
+               ("lambdarank", "uniform", "lgb_train_aggregates", "pure"),
+               ("binary_logloss", "uniform", "lgb_plus_oof_fm_score", "pure")]:
+        assert m.is_blocked(fp), f"{fp} must block without corroboration"
+
+    # A brand-new run, sharing no run_id with anything on disk, agrees.
+    assert Memory(path=str(tmp_path / "m.json")).is_blocked(cwm) is True
+
+    # Negative control: an unknown fingerprint blocks nothing, so the assertions
+    # above are about the preseeds and not about is_blocked returning True.
+    assert not m.is_blocked(("pointwise_logloss", "uniform", "no_such_thing",
+                             "pure"))
+
+
+def test_an_unscored_refutation_never_counts_toward_the_bar(tmp_path):
+    """seed_count == 0 means no paired delta was ever produced: evidence about
+    the WRITER, not about the mechanism. In the recorded run only 2 of 5
+    candidates produced one."""
+    m = Memory(path=str(tmp_path / "m.json"))
+    m.record(_ref("c1", seed_count=0))
+    m.record(_ref("c2", seed_count=0))
+    assert not m.is_blocked(_FP), "un-implemented is not refuted"
+    m.record(_ref("c3", seed_count=3))
+    assert not m.is_blocked(_FP), "still only one real measurement"
+    m.record(_ref("c4", seed_count=3))
+    assert m.is_blocked(_FP)
+
+
+def test_a_whole_run_of_refutations_leaves_the_next_run_fully_proposable(tmp_path):
+    """The regression, end to end, at the scale that exposed it: 13 families each
+    refuted twice by one run must leave the NEXT run with nothing blocked and
+    everything on probation."""
+    from llm_calls.families import ALL_FAMILIES
+
+    path = str(tmp_path / "m.json")
+    run1 = Memory(path=path)
+    for fam in ALL_FAMILIES:
+        fp = ("mechanism_family", fam, "", "")
+        for ch in ("a", "b"):
+            run1.record(EvidenceEntry(
+                fingerprint=fp, architecture="FM", loss="x", sampler="uniform",
+                split="valid_search", seed_count=3, confidence_interval=None,
+                code_hash=f"{fam}_{ch}", evidence_type="refuted_under_context",
+                note="negative"))
+    blocked_in_run1 = [f for f in ALL_FAMILIES
+                       if run1.is_blocked(("mechanism_family", f, "", ""))]
+    assert len(blocked_in_run1) == len(ALL_FAMILIES), \
+        "run 1 should block what run 1 measured"
+
+    run2 = Memory(path=path)
+    blocked_in_run2 = [f for f in ALL_FAMILIES
+                       if run2.is_blocked(("mechanism_family", f, "", ""))]
+    assert blocked_in_run2 == [], \
+        f"run 2 inherited {len(blocked_in_run2)} bans: {blocked_in_run2}"
+    assert set(run2.probationary_families()) == set(ALL_FAMILIES), \
+        "every family's evidence must still reach the prompt"

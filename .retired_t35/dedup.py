@@ -3,6 +3,8 @@ from __future__ import annotations
 from typing import List, Tuple
 
 from .client import DEFAULT_CHEAP_MODEL, call_model_text
+from .routing import effort_for, model_for
+from .usage import KIND_DEDUP
 from .personas import DEDUP_SYSTEM_PROMPT
 from .retry import call_with_schema_retry
 from .schemas import validate_dedup
@@ -66,7 +68,10 @@ def dedup_fingerprint_match(candidate_fingerprint: tuple, memory_entries: list) 
     prompt = _build_prompt(candidate, closest_ambiguous)
 
     def call_fn(p: str) -> str:
-        return call_model_text(DEDUP_SYSTEM_PROMPT, p, model=DEFAULT_CHEAP_MODEL, max_tokens=300)
+        return call_model_text(DEDUP_SYSTEM_PROMPT, p,
+                               model=model_for(KIND_DEDUP),
+                               effort=effort_for(KIND_DEDUP),
+                               max_tokens=300, kind=KIND_DEDUP)
 
     result = call_with_schema_retry(call_fn, prompt, validate_dedup)
     return result["duplicate"]

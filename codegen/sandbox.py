@@ -20,7 +20,7 @@ Candidate CLI/env contract (writer-generated candidates honour this):
 Returns {"status": "ok"|"error"|"timeout"|"diverged", "metrics": dict, "logs": str}.
 """
 from __future__ import annotations
-import os, sys, re, json, shutil, tempfile, subprocess, signal
+import os, sys, re, json, shutil, tempfile, subprocess
 
 _ROOT_FILES = ("data.py", "evaluate.py", "baseline.py", "submit.py")
 _METRICS_MARK = "##CODEGEN_METRICS##"
@@ -29,7 +29,51 @@ _DIVERGENCE_RE = re.compile(r"\b(nan|inf|-inf|\+inf)\b|overflow|loss diverged|no
 _LOG_TAIL = 8000
 
 
-def _prepare_workdir(code_path: str, root: str) -> tuple[str, str]:
+# --------------------------------------------------------------------------- #
+#  Label-permutation control (T3.4)                                            #
+# --------------------------------------------------------------------------- #
+# Appended to the WORKDIR's throwaway copy of evaluate.py when a control run is
+# requested. The repo's evaluate.py is never modified — it is a frozen deliverable
+# whose own header says the metric definition must not change — and the candidate
+# cannot disable this either, because it is appended AFTER the candidate's diff
+# has been staged and copied in.
+#
+# The shuffle is WITHIN EACH USER, which is what makes it the right null for this
+# metric: it preserves every user's positive count, so GAUC's
+# `0 < npos < len(labs)` filter selects exactly the same users and nDCG's ideal
+# DCG is unchanged, while destroying the association between labels and scores. A
+# model carrying no label information therefore lands at chance; a model reading
+# the label keeps its score, and that gap is the entire signal.
+_PERMUTE_SHIM = '\n'.join([
+    "# --- appended by codegen.sandbox: label-permutation control ---",
+    "import os as _pc_os",
+    "",
+    'if _pc_os.environ.get("CODEGEN_PERMUTE_LABELS"):',
+    "    import collections as _pc_collections",
+    "    import random as _pc_random",
+    "",
+    "    _pc_real_evaluate = evaluate",
+    "",
+    "    def evaluate(user_ids, labels, scores, k=5):",
+    '        """evaluate() with each user\'s labels shuffled among its own rows."""',
+    "        rng = _pc_random.Random(",
+    '            int(_pc_os.environ.get("CODEGEN_PERMUTE_SEED", "0")))',
+    "        rows = _pc_collections.defaultdict(list)",
+    "        for i, u in enumerate(user_ids):",
+    "            rows[u].append(i)",
+    "        labels = list(labels)",
+    "        for _u, idxs in sorted(rows.items(), key=lambda kv: str(kv[0])):",
+    "            vals = [labels[i] for i in idxs]",
+    "            rng.shuffle(vals)",
+    "            for i, v in zip(idxs, vals):",
+    "                labels[i] = v",
+    "        return _pc_real_evaluate(user_ids, labels, scores, k=k)",
+    "",
+])
+
+
+def _prepare_workdir(code_path: str, root: str,
+                     permute_labels: bool = False) -> tuple[str, str]:
     """Create an isolated workdir with the root modules (test-named files omitted)
     and the candidate. Returns (workdir, candidate_basename)."""
     workdir = tempfile.mkdtemp(prefix="codegen_exec_")
@@ -47,6 +91,11 @@ def _prepare_workdir(code_path: str, root: str) -> tuple[str, str]:
     for f in os.listdir(workdir):
         if "test" in f.lower():
             os.remove(os.path.join(workdir, f))
+    if permute_labels:
+        ev = os.path.join(workdir, "evaluate.py")
+        if os.path.exists(ev):
+            with open(ev, "a", encoding="utf-8") as fh:
+                fh.write("\n\n" + _PERMUTE_SHIM)
     return workdir, base
 
 
@@ -108,7 +157,8 @@ def _has_divergence(text: str, metrics: dict) -> bool:
 
 
 def execute(code_path: str, seed: int, split: str, wallclock_cap_seconds: int,
-            *, data_dir: str | None = None, root: str = ".") -> dict:
+            *, data_dir: str | None = None, root: str = ".",
+            permute_labels: bool = False, permute_seed: int = 0) -> dict:
     """Run `code_path` in isolation and report status + parsed metrics + logs.
 
     Parameters
@@ -120,6 +170,10 @@ def execute(code_path: str, seed: int, split: str, wallclock_cap_seconds: int,
     data_dir : str, optional   dataset dir (default env CODEGEN_DATA_DIR or
                                <root>/KuaiRand-Pure/data)
     root : str, optional       repo root holding the unchanged modules
+    permute_labels : bool      run the LABEL-PERMUTATION CONTROL: shuffle
+                               each user's labels among that user's own rows
+                               before scoring. A clean candidate collapses to
+                               chance; one reading the label keeps its score.
 
     Returns
     -------
@@ -130,7 +184,8 @@ def execute(code_path: str, seed: int, split: str, wallclock_cap_seconds: int,
                 "logs": f"candidate not found: {code_path}"}
     data_dir = data_dir or os.environ.get(
         "CODEGEN_DATA_DIR", os.path.join(root, "KuaiRand-Pure", "data"))
-    workdir, base = _prepare_workdir(code_path, root)
+    workdir, base = _prepare_workdir(code_path, root,
+                                     permute_labels=permute_labels)
 
     env = {
         "PATH": os.environ.get("PATH", ""),
@@ -140,6 +195,11 @@ def execute(code_path: str, seed: int, split: str, wallclock_cap_seconds: int,
         "CODEGEN_DATA_DIR": os.path.abspath(data_dir),
         "OMP_NUM_THREADS": "1", "OPENBLAS_NUM_THREADS": "1", "MKL_NUM_THREADS": "1",
     }
+    if permute_labels:
+        # The CONTROL run. A candidate whose score survives this is
+        # reading the label; see _PERMUTE_SHIM.
+        env["CODEGEN_PERMUTE_LABELS"] = "1"
+        env["CODEGEN_PERMUTE_SEED"] = str(permute_seed)
     if "SYSTEMROOT" in os.environ:            # windows needs it
         env["SYSTEMROOT"] = os.environ["SYSTEMROOT"]
     # Forwarded, not defaulted: baseline.py owns the default

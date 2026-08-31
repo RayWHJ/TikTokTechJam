@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from typing import Dict
 
-from .client import DEFAULT_MODEL, call_model_text
+from .client import call_model_text
+from .routing import effort_for, model_for
+from .usage import KIND_AUDIT
 from .personas import AUDITOR_SYSTEM_PROMPT
 from .retry import call_with_schema_retry
 from .schemas import validate_audit
@@ -41,6 +43,9 @@ def audit(diff: str, checklist: dict) -> Dict:
     prompt = _build_prompt(diff, checklist)
 
     def call_fn(p: str) -> str:
-        return call_model_text(AUDITOR_SYSTEM_PROMPT, p, model=DEFAULT_MODEL)
+        return call_model_text(AUDITOR_SYSTEM_PROMPT, p,
+                               model=model_for(KIND_AUDIT),
+                               effort=effort_for(KIND_AUDIT),
+                               kind=KIND_AUDIT)
 
     return call_with_schema_retry(call_fn, prompt, validate_audit)

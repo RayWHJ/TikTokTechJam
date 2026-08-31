@@ -11,8 +11,7 @@ from orchestrator.memory import Memory
 from orchestrator.selection import select
 from orchestrator.node import Node
 from orchestrator.counters import Counters
-from orchestrator.promotion import (bootstrap_delta, paired_user_deltas,
-                                    should_promote_globally)
+from orchestrator.promotion import bootstrap_delta, paired_user_deltas
 from orchestrator.convergence import local_plateau
 from orchestrator.triage import rank
 

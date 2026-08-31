@@ -6,6 +6,8 @@ found nothing reports a "best" numerically identical to the baseline — and rea
 quickly, 0.5946 looks like a result rather than the absence of one. Every run so
 far has been that case, which is exactly why it needs a test.
 """
+import re
+
 from orchestrator import driver
 from orchestrator.counters import Counters
 
@@ -85,7 +87,11 @@ def test_counters_are_printed_field_per_line(capsys):
     driver.print_final_summary(_result(counters=c))
     out = capsys.readouterr().out
     assert "counters:" in out
-    assert "proposals          11" in out
+    # Field-per-line, name then value. Matched with a flexible gap rather than a
+    # fixed one: T2.3 added `estimated_cost_usd` and `calls_without_usage`, so the
+    # column width had to grow and pinning the exact spacing pinned nothing
+    # meaningful.
+    assert re.search(r"^\s+proposals\s+11$", out, re.M), out
     assert "valid_search=28" in out
 
 

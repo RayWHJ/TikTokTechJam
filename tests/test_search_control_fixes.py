@@ -6,7 +6,7 @@ from orchestrator/_state/progress.json and root_baseline.json — the 5-iteratio
 run whose output was the unmodified baseline.
 """
 import json
-import os
+import random
 
 import pytest
 
@@ -249,13 +249,30 @@ def test_frontier_cap_is_small_enough_to_concentrate_visits():
 
 def test_mocked_run_grows_the_tree_and_reports_a_champion(tmp_path, monkeypatch):
     """End-to-end on the mocks: the tree must leave the root and the run must
-    return a champion distinct from global_best when nothing was promoted."""
+    return a champion distinct from global_best when nothing was promoted.
+
+    Also T2.6's acceptance: this passes with a mock that emits NO non-production
+    keys, so the end-to-end path finally matches the one production takes.
+
+    Node ids are pinned to a counter. `_new_id()` uses `uuid.uuid4()`, and
+    `mocks/codegen.execute` derives a candidate's per-user scores from
+    `sha1(code_path|seed)` — so whether a candidate beat its parent, and
+    therefore whether the tree grew, depended on a random UUID. Measured at
+    roughly 1 failure in 6 runs. `random.seed` cannot fix it because uuid4 reads
+    os.urandom, so the id generator itself has to be deterministic.
+    """
+    import itertools
+
     from orchestrator.mocks import harness as h, llm as l, codegen as c
     monkeypatch.setattr(driver, "harness", h)
     monkeypatch.setattr(driver, "llm", l)
     monkeypatch.setattr(driver, "codegen", c)
     monkeypatch.setattr(driver, "NODES_LOG_PATH", str(tmp_path / "nodes.jsonl"))
     monkeypatch.setattr(driver, "CHAMPION_DIR", str(tmp_path / "champions"))
+
+    ids = itertools.count()
+    monkeypatch.setattr(driver, "_new_id", lambda: f"n{next(ids):04d}")
+    random.seed(0)                       # mocks.codegen's 5% error injection
 
     res = driver.run(max_iters=8, verbose=False,
                      progress_path=str(tmp_path / "progress.json"),

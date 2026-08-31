@@ -3,7 +3,9 @@ from __future__ import annotations
 import json
 from typing import Dict, List, Optional
 
-from .client import DEFAULT_MODEL, call_model_text
+from .client import call_model_text
+from .routing import effort_for, model_for
+from .usage import KIND_REFINE
 from .personas import REFINER_SYSTEM_PROMPT
 from .retry import call_with_schema_retry
 from .schemas import validate_refinement
@@ -44,6 +46,9 @@ def refine(component: str, component_source: str,
                            prior_refines or [])
 
     def call_fn(p: str) -> str:
-        return call_model_text(REFINER_SYSTEM_PROMPT, p, model=DEFAULT_MODEL)
+        return call_model_text(REFINER_SYSTEM_PROMPT, p,
+                               model=model_for(KIND_REFINE),
+                               effort=effort_for(KIND_REFINE),
+                               kind=KIND_REFINE)
 
     return call_with_schema_retry(call_fn, prompt, validate_refinement)

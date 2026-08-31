@@ -15,7 +15,7 @@ import json
 import re
 from typing import Any, Callable
 
-from .exceptions import LLMSchemaError
+from .exceptions import LLMSchemaError, LLMTruncatedError
 
 _JSON_FENCE_RE = re.compile(r"```(?:json)?\s*(.*?)\s*```", re.DOTALL)
 
@@ -90,12 +90,23 @@ def call_with_schema_retry(
     prompt = base_user_prompt
 
     for attempt in range(max_retries + 1):
+        # NOT wrapped in the try below, and deliberately so. A truncated response
+        # is a CONFIGURATION failure — the output ceiling was too low, or the
+        # reasoning effort too high — and a retry spends the same budget the same
+        # way and fails identically. Letting LLMTruncatedError propagate turns
+        # three identical wasted calls and a misleading LLMSchemaError ("the
+        # model can't follow the schema") into one call and an accurate message.
         raw = call_fn(prompt)
         last_raw = raw
         try:
             parsed = extract_json(raw)
             result = validate_fn(parsed)
             return result
+        except LLMTruncatedError:
+            # Only reachable if a validate_fn or a future extract_json raises it.
+            # Re-raised explicitly so a later refactor that widens the handler
+            # below cannot start swallowing it.
+            raise
         except ValueError as e:
             last_error = str(e)
             prompt = _augment_prompt_with_error(base_user_prompt, raw, last_error)
