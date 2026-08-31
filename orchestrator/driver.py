@@ -549,7 +549,7 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
                 "local_best_score": c.local_best_score if c.local_best_score > float("-inf") else None,
                 "n_visits": c.n_visits,
                 "confirm_primary": c.confirm_primary,
-            }, default=str) + "\\n")
+            }, default=str) + "\n")
 
 
 def _prior_refines_for_component(component: str,

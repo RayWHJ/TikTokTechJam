@@ -1,0 +1,199 @@
+"""KuaiRand-Pure 数据加载 + 官方划分 + 特征编码。
+
+encode()     : FM 的 5 个类别域 -> 连续 id。只依赖标准库和 numpy。
+encode_lgb() : GBDT 的稠密数值特征（train-only 统计量）。同样只依赖 numpy。
+"""
+import csv, os, collections, itertools
+import numpy as np
+
+LABEL = 'long_view'
+SPLITS = {'train': (20220408, 20220421),
+          'valid': (20220422, 20220428),
+          'test':  (20220429, 20220508)}
+# 5 个特征域。想加特征就往这里加 —— 这是学生最该动的地方之一。
+FIELDS = ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket']
+
+def load(data_dir):
+    """读日志 + 视频侧特征，返回按划分切好的 dict。"""
+    vid2author = {}
+    with open(os.path.join(data_dir, 'video_features_basic_pure.csv')) as fh:
+        for r in csv.DictReader(fh):
+            vid2author[r['video_id']] = r['author_id']
+
+    rows = []
+    for f in ('log_standard_4_08_to_4_21_pure.csv', 'log_standard_4_22_to_5_08_pure.csv'):
+        with open(os.path.join(data_dir, f)) as fh:
+            for r in csv.DictReader(fh):
+                rows.append((int(r['date']), r['user_id'], r['video_id'],
+                             vid2author.get(r['video_id'], 'UNK'), r['tab'],
+                             float(r['duration_ms']), 1 if r[LABEL] != '0' else 0))
+
+    out = {}
+    for name, (lo, hi) in SPLITS.items():
+        out[name] = [x for x in rows if lo <= x[0] <= hi]
+    return out
+
+def _bucket_edges(durations, n=10):
+    return np.quantile(np.asarray(durations), np.linspace(0, 1, n + 1)[1:-1])
+
+def encode(splits):
+    """把类别特征映射成连续 id。未见过的取值统一落到该域的 UNK 槽。
+    返回 (X, y, users) per split，X 为 int32 (N, len(FIELDS))，以及 field_dims。"""
+    tr = splits['train']
+    edges = _bucket_edges([x[5] for x in tr])
+
+    def raw(x):
+        return [x[1], x[2], x[3], x[4], str(int(np.searchsorted(edges, x[5])))]
+
+    vocabs = [dict() for _ in FIELDS]
+    for x in tr:
+        for i, v in enumerate(raw(x)):
+            if v not in vocabs[i]:
+                vocabs[i][v] = len(vocabs[i])
+    unk = [len(v) for v in vocabs]                 # 每个域末尾留一个 UNK 槽
+    field_dims = [len(v) + 1 for v in vocabs]
+    offsets = np.cumsum([0] + field_dims[:-1]).astype(np.int32)
+
+    enc = {}
+    for name, rws in splits.items():
+        X = np.empty((len(rws), len(FIELDS)), dtype=np.int32)
+        y = np.empty(len(rws), dtype=np.float32)
+        users = []
+        for n, x in enumerate(rws):
+            for i, v in enumerate(raw(x)):
+                X[n, i] = vocabs[i].get(v, unk[i]) + offsets[i]
+            y[n] = x[6]
+            users.append(x[1])
+        enc[name] = (X, y, users)
+    return enc, int(sum(field_dims))
+
+
+# --------------------------------------------------------------------------- #
+#  GBDT feature encoding (used by baseline.py --model lgb)                     #
+# --------------------------------------------------------------------------- #
+# Dense features for a tree model. Every statistic below is computed on the
+# TRAIN split ONLY and then looked up for valid/test, which is what makes them
+# point-in-time safe: train is 20220408-0421, strictly earlier than valid
+# (0422-0428) and test (0429-0508), so no row is ever described by information
+# that did not exist when it was logged. A row's own label is never an input.
+#
+# Why these and not "target-encode every id": measured on this dataset, a
+# user x author pair occurs 1.07 times in train on average (1,070,326 pairs
+# over 1,141,112 rows) and user x video is sparser still. A per-pair rate is
+# therefore one observation of noise, and smoothing collapses it back to the
+# author rate. That sparsity is exactly why the FM's *embeddings* beat the
+# popularity baseline (0.5946 vs 0.5715) — SGD shares strength across users,
+# count features cannot. `video_rate_by_user_bucket` is the compromise: a
+# COARSE collaborative cross (video x user-activity-decile, ~7.5k x 10 cells
+# over 1.14M rows ≈ 15 observations each) that carries a personalisation signal
+# without dissolving into per-pair noise.
+LGB_FIELDS = [
+    'video_rate',               # item quality: the `pop` baseline's whole signal
+    'video_imp_log',            # item exposure mass
+    'author_rate',              # generalises to videos with thin history
+    'author_imp_log',
+    'user_rate',                # constant within a user, but lets the trees
+    'user_imp_log',             # modulate item features per user type
+    'duration_log',             # item-side, varies within user; long_view is a
+                                # watch-time threshold so duration is direct
+    'tab',                      # 15 levels, varies within user
+    'video_rate_by_user_bucket',  # the coarse collaborative cross
+    'video_is_new',             # 1.0 if the video is unseen in train
+]
+#: Indices into LGB_FIELDS that LightGBM should treat as categorical.
+LGB_CATEGORICAL = ['tab']
+
+#: Smoothing counts. `prior` pulls a thin per-id rate toward the global rate;
+#: `cross_prior` pulls a thin (video, bucket) cell toward that video's own rate,
+#: which is a far better fallback than the global mean.
+LGB_PRIOR = 20.0
+LGB_CROSS_PRIOR = 10.0
+LGB_USER_BUCKETS = 10
+
+
+def _rate_maps(rows, key_fn):
+    """(positives, impressions) counters keyed by key_fn(row)."""
+    pos, imp = collections.Counter(), collections.Counter()
+    for x in rows:
+        k = key_fn(x)
+        imp[k] += 1
+        pos[k] += x[6]
+    return pos, imp
+
+
+def encode_lgb(splits, prior=LGB_PRIOR, cross_prior=LGB_CROSS_PRIOR,
+               n_user_buckets=LGB_USER_BUCKETS, sort_by_user=True):
+    """Dense train-only features for a GBDT, grouped by user for ranking.
+
+    Returns (enc, feature_names, categorical_names) where
+    enc[split] = (X float32 (N, F), y float32 (N,), users list, groups int32).
+
+    Rows are SORTED BY USER inside each split, because LightGBM's ranking
+    objectives take a `group` array of contiguous run lengths rather than a key
+    column. This is safe for scoring: evaluate() buckets by user_id itself and
+    is order-independent. It does mean these arrays are NOT in submission row
+    order — submit.py's row_id contract is served by the FM path.
+    """
+    tr = splits['train']
+    gmean = sum(x[6] for x in tr) / len(tr)
+
+    vid_pos, vid_imp = _rate_maps(tr, lambda x: x[2])
+    aut_pos, aut_imp = _rate_maps(tr, lambda x: x[3])
+    usr_pos, usr_imp = _rate_maps(tr, lambda x: x[1])
+
+    def smoothed(pos, imp, k, p, fallback):
+        """Empty-count keys land exactly on `fallback` (p*fallback / p)."""
+        return (pos.get(k, 0) + p * fallback) / (imp.get(k, 0) + p)
+
+    # User activity deciles, cut on TRAIN impression counts. A user absent from
+    # train gets bucket -1 (its own level) rather than being forced into a
+    # decile it has no evidence for.
+    counts = np.array(sorted(usr_imp.values()), dtype=np.float64)
+    bucket_edges = np.quantile(counts, np.linspace(0, 1, n_user_buckets + 1)[1:-1])
+
+    def user_bucket(u):
+        n = usr_imp.get(u)
+        return -1 if n is None else int(np.searchsorted(bucket_edges, n))
+
+    # The coarse collaborative cross, also train-only.
+    cross_pos, cross_imp = _rate_maps(tr, lambda x: (x[2], user_bucket(x[1])))
+
+    tabs = sorted({x[4] for x in tr})
+    tab_code = {t: i for i, t in enumerate(tabs)}   # unseen tab -> -1
+
+    def featurise(x):
+        vid, aut, usr = x[2], x[3], x[1]
+        v_rate = smoothed(vid_pos, vid_imp, vid, prior, gmean)
+        b = user_bucket(usr)
+        return (
+            v_rate,
+            float(np.log1p(vid_imp.get(vid, 0))),
+            smoothed(aut_pos, aut_imp, aut, prior, gmean),
+            float(np.log1p(aut_imp.get(aut, 0))),
+            smoothed(usr_pos, usr_imp, usr, prior, gmean),
+            float(np.log1p(usr_imp.get(usr, 0))),
+            float(np.log1p(x[5])),
+            float(tab_code.get(x[4], -1)),
+            smoothed(cross_pos, cross_imp, (vid, b), cross_prior, v_rate),
+            0.0 if vid in vid_imp else 1.0,
+        )
+
+    enc = {}
+    for name, rws in splits.items():
+        # sort_by_user=False keeps splits[name]'s own row order, so these arrays
+        # line up index-for-index with encode()'s — needed to stack an FM score
+        # (or any other per-row model output) in as a feature. Only the ranking
+        # objectives need the contiguous-user layout.
+        if sort_by_user:
+            rws = sorted(rws, key=lambda x: x[1])   # contiguous user blocks
+        X = np.empty((len(rws), len(LGB_FIELDS)), dtype=np.float32)
+        y = np.empty(len(rws), dtype=np.float32)
+        users = []
+        for n, x in enumerate(rws):
+            X[n, :] = featurise(x)
+            y[n] = x[6]
+            users.append(x[1])
+        groups = np.array([len(list(g)) for _, g in itertools.groupby(users)],
+                          dtype=np.int32)
+        enc[name] = (X, y, users, groups)
+    return enc, list(LGB_FIELDS), list(LGB_CATEGORICAL)

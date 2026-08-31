@@ -1,0 +1,75 @@
+--- a/baseline.py
++++ b/baseline.py
+@@ -252,28 +252,51 @@
+     order, group_starts, group_ends, group_ids = group_by_user_offsets(utr)
+     pos_rows, _pos_groups, neg_starts, neg_counts, negative_order = build_bpr_tables(
+         ytr, order, group_starts, group_ends, group_ids)
+-    m = FM(dim, k=k, lr=lr, seed=seed)
+-    rng = np.random.default_rng(seed)
+-    best, best_state, bad = -1, None, 0
+-    for ep in range(1, epochs + 1):
+-        neg_offsets = (rng.random(len(pos_rows)) * neg_counts).astype(np.int32)
+-        neg_rows = negative_order[neg_starts + neg_offsets]
+-        idx = rng.permutation(len(pos_rows)); t0 = time.time()
+-        losses = [m.step_bpr(Xtr[pos_rows[idx[i:i + bs]]], Xtr[neg_rows[idx[i:i + bs]]])
+-                  for i in range(0, len(idx), bs)]
+-        va = evaluate(usel, ysel, m.predict(Xsel))
+-        if verbose:
+-            print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | {select_on} GAUC {va['GAUC']:.4f} "
+-                  f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | {time.time()-t0:.1f}s")
+-        if va['primary'] > best + 1e-5:
+-            best, bad = va['primary'], 0
+-            best_state = (m.V.copy(), m.W.copy(), np.float32(m.b))
+-        else:
+-            bad += 1
+-            if bad >= patience:
+-                if verbose: print(f"  early stop at epoch {ep}")
+-                break
++    best, best_state, best_config = -1, None, None
++    for lr_mult in (0.5, 1.0):
++        for pair_ratio in (1, 2):
++            candidate_lr = lr * lr_mult
++            m = FM(dim, k=k, lr=candidate_lr, seed=seed)
++            rng = np.random.default_rng(seed)
++            candidate_best, candidate_state, bad = -1, None, 0
++            for ep in range(1, epochs + 1):
++                idx = rng.permutation(len(pos_rows)); t0 = time.time()
++                losses = []
++                for i in range(0, len(idx), bs):
++                    batch_idx = idx[i:i + bs]
++                    batch_pos = pos_rows[batch_idx]
++                    offsets = (rng.random((pair_ratio, len(batch_idx))) *
++                               neg_counts[batch_idx][None, :]).astype(np.int32)
++                    batch_neg = negative_order[
++                        neg_starts[batch_idx][None, :] + offsets]
++                    Xpos = np.broadcast_to(
++                        Xtr[batch_pos][None, :, :],
++                        (pair_ratio,) + Xtr[batch_pos].shape).reshape(
++                            -1, Xtr.shape[1])
++                    Xneg = Xtr[batch_neg.reshape(-1)]
++                    losses.append(m.step_bpr(Xpos, Xneg))
++                va = evaluate(usel, ysel, m.predict(Xsel))
++                if verbose:
++                    print(f"  lr {candidate_lr:.6g} pairs {pair_ratio} | epoch {ep:2d} | "
++                          f"loss {np.mean(losses):.4f} | {select_on} GAUC {va['GAUC']:.4f} "
++                          f"nDCG@5 {va['nDCG@5']:.4f} primary {va['primary']:.4f} | "
++                          f"{time.time()-t0:.1f}s")
++                if va['primary'] > candidate_best + 1e-5:
++                    candidate_best, bad = va['primary'], 0
++                    candidate_state = (m.V.copy(), m.W.copy(), np.float32(m.b))
++                else:
++                    bad += 1
++                    if bad >= patience:
++                        if verbose: print(f"  early stop at epoch {ep}")
++                        break
++            if candidate_best > best:
++                best, best_state = candidate_best, candidate_state
++                best_config = (candidate_lr, pair_ratio)
++    m = FM(dim, k=k, lr=best_config[0], seed=seed)
+     m.V, m.W, m.b = best_state
++    if verbose:
++        print(f"  selected lr {best_config[0]:.6g} pairs {best_config[1]} | "
++              f"{select_on} primary {best:.4f}")
+     out, preds = {}, {}
+     for name in report_on:
+         X, y, u = enc[name]

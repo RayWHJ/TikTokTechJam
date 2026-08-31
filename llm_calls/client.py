@@ -48,7 +48,7 @@ def get_client() -> openai.OpenAI:
 
 
 def call_model_text(system: str, user: str, model: str = DEFAULT_MODEL,
-                    max_tokens: int = 2000) -> str:
+                    max_tokens: int = 6000) -> str:
     """Plain text-in/text-out call via the Responses API, no tools.
     Returns the model's response as a single string."""
     client = get_client()

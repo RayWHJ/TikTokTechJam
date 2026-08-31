@@ -1,0 +1,151 @@
+--- a/baseline.py
++++ b/baseline.py
+@@ -128,7 +128,7 @@
+  
+  
+ def build_bpr_tables(ytr, order, group_starts, group_ends, group_ids):
+-    """Pre-compute positive-row and per-user negative-range arrays for BPR.
++    """Pre-compute positive rows and contiguous same-user negative pools.
+  
+     Parameters
+     ----------
+@@ -142,63 +142,39 @@
+         user has at least one negative.
+     pos_groups : int32 array (P,)
+         Group id for each positive row.
++    neg_order : int32 array (N,)
++        Original row indices reordered so each user's negatives come first.
+     neg_starts : int32 array (P,)
+-        For each positive row, the start offset into `order` of that user's
++        For each positive row, the start offset into `neg_order` of that user's
+         negative block.
+     neg_counts : int32 array (P,)
+         Number of negatives for that user.
+  
+     Usage
+     -----
+-    # sample one random negative per positive:
+-    off = (rng.random(len(pos_rows)) * neg_counts).astype(np.int64)
+-    neg_rows = order[neg_starts + off]
++    # sample four random negatives per positive:
++    off = (rng.random((len(pos_rows), 4)) *
++           neg_counts[:, None]).astype(np.int64)
++    neg_rows = neg_order[neg_starts[:, None] + off]
+     """
+     sorted_y = ytr[order]
+  
+-    # Per-group negative counts (negatives sort before positives within each
+-    # group because lexsort on (y, user) puts y=0 first, but we don't require
+-    # that — we count explicitly).
+     neg_per_group = np.add.reduceat(
+         (sorted_y == 0).astype(np.int32), group_starts)
+     pos_per_group = (group_ends - group_starts) - neg_per_group
+     eligible = (neg_per_group > 0) & (pos_per_group > 0)
+  
+-    # Build a negative-start array: within each group the negatives are the
+-    # rows where sorted_y == 0. We need each group's negatives to be
+-    # contiguous so we can sample by offset. Re-sort within each group so
+-    # negatives come first.
+-    # Actually, since order = argsort(user_ids, stable), labels within a group
+-    # are in their original row order, not sorted by label. We need to
+-    # rearrange so negatives are contiguous within each group.
+-    new_order = np.empty_like(order)
+-    neg_start_per_group = np.empty(len(group_starts), dtype=np.int32)
+-    write = 0
+-    for g in range(len(group_starts)):
+-        s, e = group_starts[g], group_ends[g]
+-        block = order[s:e]
+-        block_y = sorted_y[s:e]
+-        negs = block[block_y == 0]
+-        poss = block[block_y == 1]
+-        neg_start_per_group[g] = write
+-        new_order[write:write + len(negs)] = negs
+-        write += len(negs)
+-        new_order[write:write + len(poss)] = poss
+-        write += len(poss)
+- 
+-    # Now rebuild with the reordered data
++    # Stable lexicographic sorting keeps user groups together and places all
++    # negatives before positives within each group without a per-user loop.
++    within_order = np.lexsort((sorted_y, group_ids))
++    new_order = order[within_order].astype(np.int32)
+     sorted_y_new = ytr[new_order]
+     positive_mask = (sorted_y_new == 1) & eligible[group_ids]
+- 
+-    # But group_ids was based on the old order. We need to rebuild group_ids
+-    # for the new order. Since we didn't change group boundaries, just the
+-    # within-group order, group_ids stays the same.
+     pos_rows = new_order[positive_mask].astype(np.int32)
+     pos_grps = group_ids[positive_mask].astype(np.int32)
+  
+-    return (pos_rows, pos_grps,
+-            neg_start_per_group[pos_grps],
+-            neg_per_group[pos_grps])
++    return (pos_rows, pos_grps, new_order,
++            group_starts[pos_grps], neg_per_group[pos_grps])
+ 
+ # ---------------- Factorization Machine ----------------
+ class FM:
+@@ -235,6 +211,30 @@
+         self.b -= self.lr * g.sum()
+         return float(-np.mean(y * np.log(sigmoid(z) + 1e-9) + (1 - y) * np.log(1 - sigmoid(z) + 1e-9)))
+ 
++    def step_sampled_softmax(self, Xpos, Xneg):
++        B = len(Xpos)
++        X = np.concatenate((Xpos[:, None, :], Xneg), axis=1)
++        Xflat = X.reshape(-1, X.shape[-1])
++        z, E, S = self.logits(Xflat)
++        z = z.reshape(B, 5)
++        zmax = z.max(axis=1, keepdims=True)
++        expz = np.exp(z - zmax)
++        probs = expz / expz.sum(axis=1, keepdims=True)
++        probs[:, 0] -= 1.0
++        g = (probs.reshape(-1) / B).astype(np.float32)
++        gV = np.zeros_like(self.V); gW = np.zeros_like(self.W)
++        np.add.at(gW, Xflat, g[:, None])
++        np.add.at(gV, Xflat, g[:, None, None] * (S[:, None, :] - E))
++        gV += self.l2 * self.V; gW += self.l2 * self.W
++        self.t += 1
++        b1, b2, eps = 0.9, 0.999, 1e-8
++        for P, G, M, Vv in ((self.V, gV, self.mV, self.vV), (self.W, gW, self.mW, self.vW)):
++            M *= b1; M += (1 - b1) * G
++            Vv *= b2; Vv += (1 - b2) * (G * G)
++            P -= self.lr * (M / (1 - b1 ** self.t)) / (np.sqrt(Vv / (1 - b2 ** self.t)) + eps)
++        self.b -= self.lr * g.sum()
++        return float(np.mean(zmax[:, 0] + np.log(expz.sum(axis=1)) - z[:, 0]))
++
+     def predict(self, X, bs=200_000):
+         return np.concatenate([self.logits(X[i:i + bs])[0] for i in range(0, len(X), bs)])
+ 
+@@ -247,13 +247,23 @@
+     touches valid_confirm, which stays a clean held-out check for promotion.
+     """
+     enc, dim = encode(splits)
+-    Xtr, ytr, _ = enc['train']; Xsel, ysel, usel = enc[select_on]
++    Xtr, ytr, utr = enc['train']; Xsel, ysel, usel = enc[select_on]
++    order, group_starts, group_ends, group_ids = group_by_user_offsets(utr)
++    pos_rows, _, neg_order, neg_starts, neg_counts = build_bpr_tables(
++        ytr, order, group_starts, group_ends, group_ids)
+     m = FM(dim, k=k, lr=lr, seed=seed)
+     rng = np.random.default_rng(seed)
+     best, best_state, bad = -1, None, 0
+     for ep in range(1, epochs + 1):
+-        idx = rng.permutation(len(ytr)); t0 = time.time()
+-        losses = [m.step(Xtr[idx[i:i + bs]], ytr[idx[i:i + bs]]) for i in range(0, len(idx), bs)]
++        idx = rng.permutation(len(pos_rows)); t0 = time.time()
++        losses = []
++        for i in range(0, len(idx), bs):
++            take = idx[i:i + bs]
++            off = (rng.random((len(take), 4)) *
++                   neg_counts[take, None]).astype(np.int64)
++            neg_rows = neg_order[neg_starts[take, None] + off]
++            losses.append(m.step_sampled_softmax(
++                Xtr[pos_rows[take]], Xtr[neg_rows]))
+         va = evaluate(usel, ysel, m.predict(Xsel))
+         if verbose:
+             print(f"  epoch {ep:2d} | loss {np.mean(losses):.4f} | {select_on} GAUC {va['GAUC']:.4f} "
+@@ -473,3 +483,4 @@
+     for sp in ('valid', 'test'):
+         r = res[sp]
+         print(f"  {sp:5s}  GAUC {r['GAUC']:.4f} | nDCG@5 {r['nDCG@5']:.4f} | primary {r['primary']:.4f}")
++
