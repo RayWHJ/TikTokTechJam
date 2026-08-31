@@ -31,8 +31,31 @@ runnable code because they ignored these limits:
   ASAM, NAS, attention layers, state-space models, LLM-based augmentation, or
   anything phrased as "using known deep learning libraries" — none of it can
   be written here.
+- THIS IS THE MOST COMMON WAY A PROPOSAL IS WASTED, so it is worth being
+  concrete. The evidence store for this repo holds 61 recorded proposals from
+  earlier runs, and the large majority named MAML or other meta-learning,
+  ColdNAS or neural architecture search, DeepFM / xDeepFM, contrastive
+  learning objectives, frequency-decomposed state-space models, or a small LLM
+  for token augmentation. Not one of those is writable in numpy inside 240
+  seconds on one core, so every one of them was a wasted iteration. Before you
+  propose a mechanism, name the numpy operations that implement it — array
+  indexing, np.add.at, a matmul, a bincount, a searchsorted. If you cannot
+  name them, the proposal is not implementable and you must propose something
+  else.
 - The change is a single-file edit to either data.py (features) or
   baseline.py (model/loss/training), reproduced in full. Not both files.
+- APPENDING A FIELD TO data.py's FIELDS LIST IS A LEGAL SINGLE-FILE CHANGE,
+  and it is cheap. data.py::FIELDS is
+  ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket'] and
+  data.py::encode() returns X as int32 (N, len(FIELDS)), built by mapping each
+  field's raw value through a train-only vocabulary with one trailing UNK slot
+  per field. So ANY new FIXED-WIDTH CATEGORICAL field is reachable by adding a
+  name to FIELDS and returning one more value from encode()'s inner raw(x) —
+  data.py only, no change to baseline.py, and the FM picks up the new embedding
+  automatically because it indexes X. Do not refuse a categorical feature
+  proposal as out of scope. What does NOT fit this shape is a
+  VARIABLE-LENGTH sequence: there is no ragged tensor here, so a mechanism
+  needing one cannot be implemented under the one-file rule.
 - One CPU core, single-threaded. The unmodified baseline trains and scores in
   18 seconds; a candidate is killed at 240 seconds. Roughly 13x the baseline's
   cost is the entire budget, so an O(users x items) or per-row-Python-loop
@@ -78,6 +101,49 @@ the ranking metric; user behaviour SEQUENCE features, which nothing in the
 repo uses yet; multi-task auxiliary loss targets (is_click, is_like,
 play_time_ms are permitted as TARGETS, never as inputs); censored regression
 on watch time; and the random-exposure log as an unbiased validation check.
+
+Note on where the effort is worth spending. The paired noise floor for an
+accept/reject decision here is about 0.0012, and a loss swap on this data is
+worth roughly +0.001 at best — the largest paired delta this search has ever
+measured is +0.0006. A bigger effect is therefore not merely worth more, it is
+EASIER TO DETECT. Direction 1 has absorbed nearly every attempt so far.
+Directions 2 and 3 are untouched by both the organisers and this repo, and are
+plausibly larger.
+
+SEQUENCE FEATURES (direction 2), CONCRETELY — these all fit the fixed-width
+categorical shape described in the implementation budget, so each is a
+single-file edit to data.py that appends to FIELDS:
+- the user's PREVIOUS video_id (the lag-1 item id);
+- the user's PREVIOUS author_id — likely stronger than previous video_id,
+  because authors repeat far more often than videos do;
+- whether the previous impression in this user's log was a long_view (a 2-value
+  field, plus UNK for the user's first row);
+- the count of THAT AUTHOR's prior impressions for THIS user, bucketed into a
+  handful of levels (0, 1, 2, 3-5, 6+);
+- the position of the row within the user's log, bucketed (a coarse
+  "how deep into the session are we").
+
+How to compute one: group the rows of a split by user, order them by date with a
+STABLE sort so the loaded log order breaks within-day ties, then take the lag.
+Note that date is the ONLY temporal field data.load() currently reads — hourmin
+and time_ms are in the CSV but are not loaded — so within-day ordering comes
+from row order in the log, not from a timestamp. Say which you rely on.
+
+TWO HARD CONSTRAINTS on any lag feature:
+- Compute it WITHIN each split, using only rows at or before the current row.
+  Never across the split boundary into the future, and never over the
+  concatenation of train and valid. A lag that reaches forward is leakage and
+  the gate and the auditor both look for it.
+- The vocabulary is still built on train only. A previous-author id unseen in
+  train lands in that field's UNK slot, which is correct and expected.
+
+WHY A LAG FIELD CAN WORK WHERE A USER-SIDE FEATURE CANNOT. The dead-ends list
+above records that `user_rate` was the largest feature gain in the stacked GBDT
+and still contributed nothing, because it is CONSTANT WITHIN A USER and the
+ranking is done inside each user. A lag field is NOT user-constant: it changes
+from row to row within the same user, so it can reorder that user's
+impressions. That difference is the whole reason this direction is live while
+adding more static user-side fields is refuted.
 """.strip()
 
 

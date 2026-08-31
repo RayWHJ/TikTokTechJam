@@ -93,7 +93,18 @@ makes that safe.
 
 A feature that is CONSTANT WITHIN A USER contributes exactly zero to this
 metric, because the ranking is done inside each user. Pure user-side features
-are only useful through an interaction with an item-side value.
+are only useful through an interaction with an item-side value. A LAG feature
+(the user's previous video_id / author_id, whether their previous impression was
+a long_view) is NOT user-constant — it varies row to row inside one user — which
+is precisely why it can move this metric where a user-side aggregate cannot.
+
+Adding a fixed-width categorical field is a legal, self-contained change: append
+the name to FIELDS and return one more value from encode()'s inner raw(x).
+encode() returns X as int32 (N, len(FIELDS)) and the FM indexes X, so it picks
+up the new embedding with no change to baseline.py. Two rules for a lag feature:
+compute it WITHIN each split using only rows at or before the current row (never
+reaching forward, never across the split boundary), and leave the vocabulary
+train-only so an unseen value lands in that field's UNK slot.
 {_RUNTIME_RULES}
 {_SAFETY_RULES}
 {_DIFF_FORMAT_RULES}"""
