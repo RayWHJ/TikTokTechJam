@@ -197,7 +197,7 @@ def _exhausted_families(path: str | None = None) -> dict:
                     continue
                 if comp not in by_component:
                     by_component[comp] = {"attempts": 0, "promotions": 0,
-                                          "best_delta": float("-inf")}
+                                          "best_delta": 0.0}
                 entry = by_component[comp]
                 entry["attempts"] += 1
                 if r.get("status") == "promoted":
@@ -209,7 +209,7 @@ def _exhausted_families(path: str | None = None) -> dict:
                 continue
     # Only report components with enough attempts to be considered exhausted
     return {k: v for k, v in by_component.items()
-            if v["attempts"] >= 5 and v["promotions"] == 0}
+            if v["attempts"] >= 5 and v["best_delta"] < 0.0002}
 
 def _new_id() -> str:
     return uuid.uuid4().hex[:8]
@@ -226,6 +226,70 @@ def _new_root() -> Node:
                 operation="draft",
                 local_best_score=FALLBACK_ROOT_PRIMARY)
 
+def _rebuild_node(rec: dict) -> Node:
+    """Turn one nodes.jsonl line back into a Node instance."""
+    n = Node(
+        id=rec["id"],
+        parent_id=rec.get("parent_id"),
+        code_path=rec.get("code_path") or "baseline.py",
+        diagnosis=rec.get("diagnosis"),
+        hypothesis=rec.get("hypothesis"),
+        status=rec.get("status", "open"),
+        operation=rec.get("operation", "improve"),
+        fix_attempts=rec.get("fix_attempts", 0),
+        evidence_type=rec.get("evidence_type"),
+        code_dir=rec.get("code_dir") or ".",
+        n_visits=rec.get("n_visits", 0),
+        mean_delta=rec.get("mean_delta"),
+        p_positive=rec.get("p_positive"),
+        lower_95=rec.get("lower_95"),
+        confirm_primary=rec.get("confirm_primary"),
+    )
+    lbs = rec.get("local_best_score")
+    if lbs is not None:
+        n.local_best_score = float(lbs)
+    # Restore per-user scores keyed by int seed. JSON turns int keys into
+    # strings, so we coerce back.
+    puw = rec.get("per_user_by_seed") or {}
+    n.per_user_by_seed = {int(k): v for k, v in puw.items()}
+    psp = rec.get("per_seed_primary") or {}
+    n.per_seed_primary = {int(k): float(v) for k, v in psp.items()}
+    n.seeds_run = list(rec.get("seeds_run") or n.per_seed_primary.keys())
+    return n
+ 
+ 
+def _load_checkpoint(progress_path: str, nodes_log_path: str) -> dict | None:
+    """Read prior run state off disk. Returns None if either file missing."""
+    if not (os.path.exists(progress_path) and os.path.exists(nodes_log_path)):
+        return None
+    with open(progress_path, encoding="utf-8") as fh:
+        prog = json.load(fh)
+    nodes_by_id: dict = {}
+    with open(nodes_log_path, encoding="utf-8") as fh:
+        for line in fh:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            # Last-write-wins for the same id: a node appears once per iter
+            # it was written to the log, and the last write has the freshest
+            # status/scores. Rebuild each time to keep it simple.
+            nodes_by_id[rec["id"]] = _rebuild_node(rec)
+ 
+    # open_nodes: everything with status "open" or "promoted" (the champion
+    # stays selectable — it has the best score so far).
+    open_nodes = [n for n in nodes_by_id.values()
+                  if n.status in ("open", "promoted")]
+ 
+    return {
+        "nodes_by_id": nodes_by_id,
+        "open_nodes": open_nodes,
+        "global_best": prog.get("global_best"),
+        "history": list(prog.get("history") or []),
+        "iter_history": list(prog.get("iter_history") or []),
+        "iters_completed": prog.get("iters_completed", 0),
+        "iter_records": list(prog.get("iterations") or []),
+    }
 
 def _measure_root(root: Node, counters: Counters, *, seeds=ROOT_SEEDS,
                   split: str = "valid_search", cache_path: str | None = None,
@@ -460,7 +524,14 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
                 "lower_95": c.lower_95,
                 "fix_attempts": c.fix_attempts,
                 "wallclock_used_s": round(c.wallclock_used_s, 2),
-            }, default=str) + "\n")
+                # NEW: full per-user paired-bootstrap data. Load-bearing for
+                # resume — without it, no child of this node can score.
+                "per_user_by_seed": c.per_user_by_seed,
+                "seeds_run": c.seeds_run,
+                "local_best_score": c.local_best_score if c.local_best_score > float("-inf") else None,
+                "n_visits": c.n_visits,
+                "confirm_primary": c.confirm_primary,
+            }, default=str) + "\\n")
 
 
 def _prior_refines_for_component(component: str,
@@ -648,10 +719,21 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         progress_path: str | None = PROGRESS_PATH,
         root_baseline_path: str | None = ROOT_BASELINE_PATH,
         confirm_baseline_path: str | None = CONFIRM_BASELINE_PATH,
-        memory_path: str | None = None):
+        memory_path: str | None = None,
+        resume: bool = False):
     memory = Memory(path=memory_path) if memory_path else Memory()
     counters = Counters()
     t_start = time.time()
+
+    checkpoint = None
+    if resume and progress_path:
+        checkpoint = _load_checkpoint(progress_path, NODES_LOG_PATH)
+        if checkpoint is None:
+            if verbose:
+                print("[resume] no checkpoint found, starting fresh")
+        elif verbose:
+            print(f"[resume] loaded {len(checkpoint['nodes_by_id'])} nodes "
+                  f"from prior run at iter {checkpoint['iters_completed']}")
 
     # nodes.jsonl is append-only within a run, so a fresh run must start clean
     # or its records interleave with the previous run's under the same iter
@@ -660,21 +742,52 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         os.remove(NODES_LOG_PATH)
 
     root = _new_root()
-    if verbose:
-        print(f"[root] measuring unmodified baseline on valid_search "
-              f"(seeds {list(ROOT_SEEDS)}) ...")
-    root_measured = _measure_root(root, counters, cache_path=root_baseline_path,
+    root_measured = False
+    if checkpoint is not None:
+        # Reuse the resumed root node so its id matches every existing
+        # parent_id in nodes.jsonl. Find the operation=="draft" node.
+        drafts = [n for n in checkpoint["nodes_by_id"].values()
+                  if n.operation == "draft"]
+        if drafts:
+            root = drafts[0]
+            root_measured = bool(root.per_user_by_seed)
+            if verbose:
+                print(f"[resume] using cached root {root.id[:8]} "
+                      f"primary={root.local_best_score:.4f}")
+        else:
+            checkpoint = None  # fall through to fresh measurement
+ 
+    if checkpoint is None:
+        if verbose:
+            print(f"[root] measuring unmodified baseline on valid_search "
+                  f"(seeds {list(ROOT_SEEDS)}) ...")
+        root_measured = _measure_root(root, counters, cache_path=root_baseline_path,
                                   verbose=verbose)
-    if verbose:
-        n_users = len(next(iter(root.per_user_by_seed.values()), {}))
-        print(f"[root] primary={root.local_best_score:.4f} "
-              f"seeds={root.seeds_run} per_user_users={n_users} "
-              f"measured={root_measured}")
+        if verbose:
+            n_users = len(next(iter(root.per_user_by_seed.values()), {}))
+            print(f"[root] primary={root.local_best_score:.4f} "
+                  f"seeds={root.seeds_run} per_user_users={n_users} "
+                  f"measured={root_measured}")
 
-    open_nodes: List[Node] = [root]
-    global_best = root.local_best_score
-    global_best_node = root
-    history: List[float] = [root.local_best_score]
+    if checkpoint is not None:
+        open_nodes: List[Node] = checkpoint["open_nodes"]
+        if root not in open_nodes:
+            open_nodes.insert(0, root)
+        global_best = checkpoint["global_best"] or root.local_best_score
+        history: List[float] = checkpoint["history"] or [root.local_best_score]
+        promoted = [n for n in checkpoint["nodes_by_id"].values()
+                    if n.status == "promoted"]
+        global_best_node = max(promoted + [root],
+                            key=lambda n: n.local_best_score)
+        if verbose:
+            print(f"[resume] champion={global_best_node.id[:8]} @ "
+                f"{global_best:.4f}, resuming from iter "
+                f"{checkpoint['iters_completed'] + 1}")
+    else:
+        open_nodes: List[Node] = [root]
+        global_best = root.local_best_score
+        global_best_node = root
+        history: List[float] = [root.local_best_score]
 
     # The root is line 0 of the log: the draft seed every later node descends
     # from, emitted before any iteration so the tree reads top-down.
@@ -689,8 +802,13 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
     # One entry per iteration. Kept separate from `history`, which stays a
     # promotion-only ladder because local_plateau() and llm.diagnose() both
     # read it — padding it per-iteration would trip the plateau break at ~4.
-    iter_records: List[dict] = []
-    iter_history: List[float] = [root.local_best_score]   # index 0 = baseline
+    if checkpoint is not None:
+        iter_records: List[dict] = checkpoint["iter_records"]
+        iter_history: List[float] = (checkpoint["iter_history"]
+                                     or [root.local_best_score])
+    else:
+        iter_records: List[dict] = []
+        iter_history: List[float] = [root.local_best_score]   # index 0 = baseline
 
     # Refine scheduling. Private to the run — deliberately not persisted to
     # nodes.jsonl, which records what was tried, not how it was scheduled.
@@ -711,7 +829,11 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         """
         nonlocal iter_history
         pairs = [(c, _scalar_primary(c)) for c in candidates]
-        scored = [(c, s) for c, s in pairs if s > float("-inf")]
+        # No-ops score identically to their parent by construction, so their score
+        # isn't new evidence — filter them out of iter_primary and best-of-iteration.
+        # Still included in the candidates[] list below (for the full log record).
+        scored = [(c, s) for c, s in pairs
+          if s > float("-inf") and c.evidence_type != "no_op"]
         best_node, iter_primary = max(scored, key=lambda cs: cs[1],
                                       default=(None, None))
         # The paired delta is the honest read on whether this iteration found
@@ -744,7 +866,9 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             "running_best": iter_history[-1],
             "improvement_score": improvement_score,
             "iter_primary_node": best_node.id if best_node else None,
-            "curr_vs_baseline": (iter_primary - global_best_at_start)
+            "curr_vs_baseline": (iter_primary - root.local_best_score)
+                                if iter_primary is not None else None,
+            "curr_vs_champion": (iter_primary - global_best_at_start)
                                 if iter_primary is not None else None,
             "best_mean_delta": best_mean_delta,
             "best_mean_delta_node": best_delta_node.id if best_delta_node else None,
@@ -781,6 +905,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                              f" | best paired delta {rec['best_mean_delta']:+.4f}")
                 print(f"[iter {it}] iter_primary={rec['iter_primary']:.4f} "
                       f"({rec['curr_vs_baseline']:+.4f} vs baseline)"
+                      f"{rec['curr_vs_champion']:+.4f} vs champion)"
                       f"{delta_str} | candidates: {scores_str}")
             else:
                 # Say why there's no score, else "n/a" is unreadable in run.log.
@@ -810,7 +935,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 "iterations": iter_records,
             })
 
-    for it in range(1, max_iters + 1):
+    start_iter = (checkpoint["iters_completed"] + 1) if checkpoint else 1
+    for it in range(start_iter, max_iters + 1):
         elapsed = time.time() - t_start
         if verbose:
             # Leading blank line, so each iteration is one visually separate
@@ -1148,6 +1274,9 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             if should_continue_locally(mean_d, p_pos, lower_95):
                 if c not in open_nodes:
                     open_nodes.append(c)
+            else:
+                c.status = 'closed'
+                c.evidence_type = c.evidence_type or 'not_significant'
 
             # 5. Promotion — sealed valid_confirm scorer, only when trigger clears.
             #
@@ -1304,6 +1433,9 @@ if __name__ == "__main__":
     ap.add_argument("--max-iters", type=int, default=5)
     ap.add_argument("--show-diffs", action="store_true",
                     help="print each generated diff (verbose, useful for debugging)")
+    ap.add_argument("--resume", action="store_true",
+                    help="continue from the state in orchestrator/_state/ "
+                         "(nodes.jsonl + progress.json) instead of clearing")
     args = ap.parse_args()
 
     SHOW_DIFFS = args.show_diffs
@@ -1338,5 +1470,5 @@ if __name__ == "__main__":
         }
         print(f"[mock] state dir: {mock_state}")
 
-    result = run(max_iters=args.max_iters, **run_kwargs)
+    result = run(max_iters=args.max_iters, resume=args.resume, **run_kwargs)
     print_final_summary(result)
