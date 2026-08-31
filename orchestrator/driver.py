@@ -659,6 +659,108 @@ def _apply_verdict(c: Node, parent: Node, root: Node, verdict_llm,
               f", next: {c.next_action}) — {c.verdict_reason}")
 
 
+#: Canonical component names, and the substrings that map onto them. Checked in
+#: order, first match wins, so the SPECIFIC buckets come before the generic ones
+#: they would otherwise be swallowed by ("sequence features" contains "feature").
+#:
+#: This normalisation is what makes the attempt budget below able to fire at all.
+#: `component` is a free-form string the diagnostician invents — the mock returns
+#: "loss", a real diagnosis returned "loss_function", and a third phrasing would
+#: be "objective mismatch". Counted verbatim, three attempts at the same
+#: bottleneck under three spellings look like one attempt each and the budget
+#: never trips.
+_COMPONENT_ALIASES: tuple[tuple[str, tuple[str, ...]], ...] = (
+    ("sequence_features", ("sequence", "history", "behaviour", "behavior",
+                           "lag", "session")),
+    ("auxiliary_targets", ("auxiliar", "multi-task", "multitask", "multi task")),
+    ("loss_function", ("loss", "objective", "criterion", "ranking metric "
+                       "mismatch")),
+    ("sampling", ("sampl", "negative")),
+    ("regularization", ("regulari", "dropout", "weight decay", "l2 ", "overfit")),
+    # Plain substrings, not regexes — these are matched with `in`, so a token
+    # like r"\blr\b" would silently never fire.
+    ("optimization", ("optimiz", "learning rate", "learning_rate", "adam",
+                      "schedule", "epoch", "convergence")),
+    ("feature_engineering", ("feature", "encoding", "field", "data.py",
+                             "representation", "input")),
+    ("architecture", ("architecture", "capacity", "embedding dim", "model "
+                      "family", "interaction order")),
+)
+
+
+def _canonical_component(component: str | None) -> str | None:
+    """Map a free-form diagnosis component onto a canonical bucket.
+
+    Unmatched names fall through to their own lowercased selves rather than a
+    catch-all, so a genuinely novel bottleneck gets its own budget instead of
+    inheriting an unrelated one's exhaustion.
+    """
+    if not component:
+        return None
+    text = str(component).strip().lower()
+    for canon, tokens in _COMPONENT_ALIASES:
+        if any(t in text for t in tokens):
+            return canon
+    return text
+
+
+#: A component is exhausted after this many SCORED attempts that failed to beat
+#: COMPONENT_EXHAUSTED_DELTA. Attempts that never produced a paired delta
+#: (failed_implementation, timeout, no_op) are deliberately excluded: they are
+#: evidence about the WRITER, not about the component, and counting them would
+#: retire a bottleneck that was never actually tested. In the recorded run only
+#: 5 of 11 candidates ever produced a paired delta, so the distinction decides
+#: whether the budget measures anything real.
+COMPONENT_ATTEMPT_BUDGET = 3
+
+#: The bar a component's best paired delta must clear to stay live. Sits below
+#: the 0.0008 baseline seed std on purpose: "no attempt on this component has
+#: produced a gain even the size of measurement noise".
+COMPONENT_EXHAUSTED_DELTA = 0.0005
+
+#: The README's ranked unexplored directions, as canonical component names, used
+#: only as the deterministic fallback when the diagnostician insists on an
+#: exhausted component twice. Ordered by the starter kit's own order of promise.
+UNEXPLORED_PRIORITY = ("loss_function", "sequence_features",
+                       "auxiliary_targets", "feature_engineering")
+
+
+def _component_ledger(all_nodes: List[Node]) -> dict:
+    """Per-component tally of what has been attempted and what it measured.
+
+    Keyed by canonical component. `scored` counts only attempts that produced a
+    paired delta; `attempts` counts every candidate ever created for that
+    component, so the two together say whether a component looks bad or merely
+    looks untested.
+    """
+    out: dict = {}
+    for n in all_nodes:
+        if n.hypothesis is None:
+            continue                 # the root draft has no component
+        comp = _canonical_component((n.diagnosis or {}).get("component"))
+        if comp is None:
+            continue
+        rec = out.setdefault(comp, {"attempts": 0, "scored": 0,
+                                    "best_mean_delta": None, "verdicts": []})
+        rec["attempts"] += 1
+        if n.mean_delta is not None:
+            rec["scored"] += 1
+            if (rec["best_mean_delta"] is None
+                    or n.mean_delta > rec["best_mean_delta"]):
+                rec["best_mean_delta"] = n.mean_delta
+        if n.verdict:
+            rec["verdicts"].append(n.verdict)
+    return out
+
+
+def _exhausted_components(ledger: dict) -> set:
+    """Components with enough SCORED attempts and nothing to show for them."""
+    return {comp for comp, r in ledger.items()
+            if r["scored"] >= COMPONENT_ATTEMPT_BUDGET
+            and (r["best_mean_delta"] is None
+                 or r["best_mean_delta"] < COMPONENT_EXHAUSTED_DELTA)}
+
+
 #: How much of a failed ancestor's log tail to carry. ~600 chars is enough for a
 #: Python traceback's final frame plus its exception line, which is the part that
 #: says what to fix.
@@ -763,6 +865,7 @@ def _build_improve_candidates(parent: Node, *,
                               iter_history: List[float],
                               improvement_score: float | None,
                               tried: List[dict] | None = None,
+                              component_ledger: dict | None = None,
                               verbose: bool = True
                               ) -> tuple[dict, List[Node]]:
     """The pre-Phase-2 improve path, factored out and enriched with
@@ -786,18 +889,78 @@ def _build_improve_candidates(parent: Node, *,
                             if v is not None}
 
     tried = tried or []
-    diag = diag_llm.diagnose({
-        "parent": parent.id,
-        "history": history,                     # promotion ladder (unchanged)
-        "iter_history": list(iter_history),     # iteration-level trajectory
-        "improvement_score": improvement_score, # current ε/N plateau signal
-        "ablations": cached_ablations or None,
-        # Every prior attempt and what it measured. Without this the
-        # diagnostician re-derived the same bottleneck from the same trajectory
-        # every iteration; see _attempt_ledger.
-        "tried": tried or None,
-    })
+    component_ledger = component_ledger or {}
+    exhausted = _exhausted_components(component_ledger)
+
+    def _ask(refusal: str | None = None) -> dict:
+        ctx = {
+            "parent": parent.id,
+            "history": history,                     # promotion ladder (unchanged)
+            "iter_history": list(iter_history),     # iteration-level trajectory
+            "improvement_score": improvement_score, # current ε/N plateau signal
+            "ablations": cached_ablations or None,
+            # Every prior attempt and what it measured. Without this the
+            # diagnostician re-derived the same bottleneck from the same
+            # trajectory every iteration; see _attempt_ledger.
+            "tried": tried or None,
+            # Per-component tallies, and the components that have spent their
+            # budget without producing a gain.
+            "component_ledger": component_ledger or None,
+            "exhausted_components": sorted(exhausted) or None,
+        }
+        if refusal:
+            ctx["refusal"] = refusal
+        return diag_llm.diagnose(ctx)
+
+    diag = _ask()
     counters.bump("tokens", 500)
+
+    # Enforce the exhaustion budget HERE, not only in the prompt. A prompt
+    # request is what failed: the diagnostician kept re-deriving the same
+    # bottleneck from the same flat trajectory because the trajectory really did
+    # look flat, and nothing in the loop could tell it to stop.
+    named = _canonical_component(diag.get("component"))
+    if named in exhausted:
+        if verbose:
+            print(f"  diagnosis named exhausted component {named!r} "
+                  f"({component_ledger[named]['scored']} scored attempts, best "
+                  f"delta {component_ledger[named]['best_mean_delta']}) — "
+                  f"re-asking once")
+        diag = _ask(refusal=(
+            f"You named {diag.get('component')!r}, which is in "
+            f"exhausted_components. That component has already had "
+            f"{component_ledger[named]['scored']} scored attempts whose best "
+            f"paired delta was "
+            f"{component_ledger[named]['best_mean_delta']}, below the "
+            f"{COMPONENT_EXHAUSTED_DELTA} bar. Name the next most load-bearing "
+            f"component instead, and do not name any component listed in "
+            f"exhausted_components."))
+        counters.bump("tokens", 500)
+        named = _canonical_component(diag.get("component"))
+
+    if named in exhausted:
+        # It insisted twice. Substitute deterministically rather than spend a
+        # third call, and record that this happened so the run log shows the
+        # diagnosis was overridden rather than produced.
+        fallback = next((c for c in UNEXPLORED_PRIORITY if c not in exhausted),
+                        None)
+        if fallback is None:
+            if verbose:
+                print(f"  every priority component is exhausted; keeping "
+                      f"{diag.get('component')!r}")
+            diag["exhaustion_note"] = ("all priority components exhausted; "
+                                       "model's choice kept")
+        else:
+            if verbose:
+                print(f"  diagnosis insisted on exhausted {named!r}; "
+                      f"falling back to {fallback!r}")
+            diag["exhaustion_fallback"] = {"refused": diag.get("component"),
+                                           "substituted": fallback}
+            diag["component"] = fallback
+
+    # Everything below reads diag["component"], so the substitution above has to
+    # land before this line — the writer is routed at the replacement, not at
+    # the component that was refused.
     evidence_card = diag_llm.ground_in_literature(diag["bottleneck"])
     counters.bump("tokens", 500)
     hypotheses = diag_llm.generate_hypothesis(diag, evidence_card, tried=tried)
@@ -1229,6 +1392,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 iter_history=iter_history,
                 improvement_score=recent_improvement,
                 tried=_attempt_ledger(all_nodes, parent),
+                component_ledger=_component_ledger(all_nodes),
                 verbose=verbose,
             )
             improves_since_refine += 1

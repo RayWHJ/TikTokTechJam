@@ -187,6 +187,26 @@ bottleneck. Naming the same bottleneck a fourth time because the trajectory
 still looks flat is the single most expensive failure mode available to you:
 it costs an entire iteration and returns information you already had.
 
+When an "exhausted_components" field is present, every component named in it
+is CLOSED. Each has already had at least 3 attempts that produced a real
+measurement, and the best paired delta across all of them was below 0.0005 —
+smaller than the baseline's own 0.0008 seed-to-seed noise. You must NOT name
+any of them as the bottleneck, however strongly the trajectory still points
+there. Name the next most load-bearing component instead.
+
+The accompanying "component_ledger" field gives, per component, how many
+candidates were created for it ("attempts"), how many produced a paired
+measurement ("scored"), and the best delta any of them achieved. Read the two
+counts separately: a component with many attempts but few SCORED ones is not
+refuted, it is un-implemented — the writer could not build it — and it remains
+a legitimate bottleneck. Only "scored" attempts are evidence about the
+component itself.
+
+If you name an exhausted component anyway you will be asked once more with a
+"refusal" field explaining why, and if you name it again the orchestrator will
+substitute a component deterministically and record that your diagnosis was
+overridden. That is a wasted call; read the field the first time.
+
 When an "ablations" field is present, it maps component names to the
 (parent - parent_without_component) delta observed by controlled
 ablation. A small delta means the pipeline barely depends on that
