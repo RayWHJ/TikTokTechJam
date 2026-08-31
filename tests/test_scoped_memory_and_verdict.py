@@ -1,12 +1,17 @@
 """Tests for the ancestor-scoped debug memory (2A) and the rubric verdict (2B).
 
 Both close the same gap from opposite ends: the recorded 5-iteration run in
-orchestrator/_state/ produced 11 candidates, of which 6 were filed
-failed_implementation and 1 timeout — so the repair operator handled the
-majority of candidates and received nothing but a traceback and a file. The
-other 4 were scored against a `success_criterion_paired` between +0.004 and
-+0.007 that no component ever read, so "refuted", "never implemented" and
-"criterion uncalibrated by 8x" all closed a node identically.
+orchestrator/_state/ produced 11 candidates, of which 5 were filed
+failed_implementation and 1 timed out — so the repair operator handled the modal
+outcome and received nothing but a traceback and a file. The other 5 were scored
+against a `success_criterion_paired` that no component ever read, so "refuted",
+"never implemented" and "criterion uncalibrated by 8x" all closed a node
+identically.
+
+Counts are verified against orchestrator/_state/progress.json. The fix plan this
+work follows says "6 of 11 failed_implementation" and "only 2 of 11 ever produced
+a paired delta"; the surviving record says 5 and 5. The paired numbers the tests
+below pin (+0.000593 at p_pos 0.776, lower_95 -0.000673) do match it exactly.
 """
 import json
 

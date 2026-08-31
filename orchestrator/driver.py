@@ -676,8 +676,9 @@ def _ancestor_chain(node: Node, all_nodes: List[Node],
     AIRA's "ancestral memories for Debug" (arXiv:2507.02554). The repair
     operator used to receive a traceback and a file and nothing else — not what
     the edit was trying to do, not that its ancestors had already failed the
-    same way. It handled 7 of the 11 candidates in the recorded run, so the
-    majority path was the blind one.
+    same way. It handled 6 of the 11 candidates in the recorded run (5
+    failed_implementation + 1 timeout, per progress.json), so the modal path
+    was the blind one.
 
     Each entry carries what the two branches of the debug instruction need to be
     distinguishable: the mechanism and evidence_type say whether the ancestor
@@ -1332,7 +1333,7 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 # hypothesis and ancestors: without them the repair model saw a
                 # traceback and a file, with no idea what the edit was trying to
                 # do or that its ancestors had already failed the same way. This
-                # operator handled 7 of the 11 candidates in the recorded run.
+                # operator handled 6 of the 11 candidates in the recorded run.
                 repair = codegen.debug_and_retry(
                     c.code_path, res["logs"], root=cand_dir,
                     hypothesis=c.hypothesis,

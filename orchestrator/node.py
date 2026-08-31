@@ -70,9 +70,11 @@ class Node:
     # Exists so driver._ancestor_chain can tell the debug operator not just that
     # an ancestor failed but HOW. Before this the per-attempt failure reason
     # lived only in the run log, never on the Node, so nothing downstream could
-    # read it: 6 of the 11 candidates in orchestrator/_state/nodes.jsonl were
-    # filed as failed_implementation and 1 as timeout, and every repair attempt
-    # on them started from a blank slate.
+    # read it: of the 11 candidates in the recorded run, 5 were filed
+    # failed_implementation and 1 timed out, and every repair attempt on them
+    # started from a blank slate. (Counts verified against
+    # orchestrator/_state/progress.json, which is now the only surviving copy
+    # of that run's per-candidate record.)
     last_error_excerpt: Optional[str] = None
 
     # Verdict on this node's own declared success_criterion_paired, from

@@ -121,8 +121,8 @@ def debug_and_retry(code_path: str, error_context: str, *,
     reachable in this signature or trivially addable, and the driver passed
     neither: the repair model saw a traceback and a file, with no idea what the
     edit was trying to do or that its ancestors had failed the same way. Since
-    this operator handled 7 of the 11 candidates in the recorded run (6
-    failed_implementation, 1 timeout), it was the majority path and it was
+    this operator handled 6 of the 11 candidates in the recorded run (5
+    failed_implementation, 1 timeout), it was the modal path and it was
     running blind. `ancestors` comes from
     orchestrator.driver._ancestor_chain — newest first.
 
