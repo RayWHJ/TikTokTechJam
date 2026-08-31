@@ -42,8 +42,20 @@ runnable code because they ignored these limits:
   indexing, np.add.at, a matmul, a bincount, a searchsorted. If you cannot
   name them, the proposal is not implementable and you must propose something
   else.
-- The change is a single-file edit to either data.py (features) or
-  baseline.py (model/loss/training), reproduced in full. Not both files.
+- The change is a single-file edit to baseline.py (model/loss/training) or
+  data.py (features), reproduced in full. Not both files. The auxiliary
+  feedback signals are ALREADY plumbed — data.load() carries is_click,
+  is_like, is_follow, is_comment, is_forward and play_time_ms on every row,
+  and data.aux_targets(splits) returns them per split as a float32
+  (N, len(AUX_SIGNALS)) array aligned row-for-row with encode()'s X. So a
+  multi-task candidate is a baseline.py-ONLY change: add an auxiliary head and
+  a weighted term to the loss, and call data.aux_targets for the labels. This
+  is a narrow exception for an existing seam, not permission for a two-file
+  edit — the one-file rule is what keeps the diff reviewable.
+- An auxiliary signal is a TARGET, never an INPUT. The value on the row being
+  scored is that row's own outcome, so putting it in the feature matrix leaks
+  the label and the static gate rejects it — by signal name and by
+  aux_targets/AUX_SIGNALS appearing in feature-matrix construction.
 - APPENDING A FIELD TO data.py's FIELDS LIST IS A LEGAL SINGLE-FILE CHANGE,
   and it is cheap. data.py::FIELDS is
   ['user_id', 'video_id', 'author_id', 'tab', 'dur_bucket'] and

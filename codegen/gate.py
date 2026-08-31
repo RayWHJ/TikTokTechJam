@@ -172,6 +172,38 @@ _TARGET_TOKENS = re.compile(
     r"(target|label|\by_|_y\b|loss|aux_loss|bce|logloss|criterion|_head\b|"
     r"multitask|multi_task|task_weight)", re.IGNORECASE)
 
+# data.py's aux seam, by NAME. Rule 4 above matches individual signal names, and
+# `X = np.column_stack([X, aux_targets(splits)['train']])` contains none of them
+# — so without this the one legitimate accessor is also the one way to leak
+# through it undetected.
+#
+# Matched NARROWLY, against feature-matrix construction only, rather than through
+# _is_input_use. "aux_targets" contains the substring "target", and the natural
+# multi-task loss line mentions X:
+#     aux_loss = bce(m.aux_head(X), aux_targets(splits)['train'])
+# _is_input_use fires on the bare `X` there, so reusing it would block the exact
+# legitimate usage this seam exists to enable.
+_AUX_SEAM = re.compile(r"\b(aux_targets|AUX_SIGNALS)\b")
+_FEATURE_MATRIX_BUILD = re.compile(
+    r"(np\.(column_stack|concatenate|hstack|vstack|stack|append)\s*\(|"
+    r"^\s*X\w*\s*=|\bX\w*\s*=\s*np\.|X\[[^\]]*\]\s*=|"
+    r"FIELDS\s*(\.append|\+|\[)|"
+    r"^\s*(features?|inputs?|feats?)\s*=)")
+
+
+def _check_aux_seam(added: list[tuple[int, str]]) -> list[str]:
+    reasons = []
+    for _, raw in added:
+        code = _strip_inline_comment(raw)
+        if _AUX_SEAM.search(code) and _FEATURE_MATRIX_BUILD.search(code):
+            reasons.append(
+                f"data.aux_targets/AUX_SIGNALS values built into a FEATURE "
+                f"MATRIX. They are the same-row outcome for the row being "
+                f"scored, so they are permitted only as auxiliary LOSS TARGETS: "
+                f"`{raw.strip()}`")
+    return reasons
+
+
 def _check_auxiliary(added: list[tuple[int, str]]) -> list[str]:
     reasons = []
     for _, raw in added:
@@ -276,6 +308,7 @@ def pre_execution_gate(code_diff: str) -> dict:
     reasons += _check_non_causal(added)
     reasons += _check_external(added)
     reasons += _check_auxiliary(added)
+    reasons += _check_aux_seam(added)
     reasons += _check_rng_isolation(added, _removed_lines(code_diff))
 
     # de-duplicate while preserving order

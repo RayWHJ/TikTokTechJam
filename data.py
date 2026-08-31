@@ -57,8 +57,58 @@ def cut_train_subsplits(splits):
         out[name] = [x for x in splits['train'] if lo <= x[0] <= hi]
     return out
 
+#: Auxiliary feedback signals, loaded onto each row tuple at index 7 and beyond
+#: in exactly this order. They are permitted as auxiliary LOSS TARGETS and are
+#: NEVER model inputs — the value for the row being scored is the same-row
+#: outcome, so feeding it in is leakage. codegen/gate.py rule 4 blocks that
+#: statically and codegen/constants.py::AUXILIARY_SIGNALS must list every name
+#: here (tests/test_aux_targets.py asserts it does).
+#:
+#: Why they are loaded at all: multi-task auxiliary targets are the starter kit's
+#: own direction 3, and it was structurally unreachable. load() read only date /
+#: user_id / video_id / author_id / tab / duration_ms / long_view, so no
+#: candidate could use these as targets however it was written — and the one-file
+#: rule forbade a candidate from adding them to data.py and consuming them in
+#: baseline.py at the same time. Plumbing them here, plus aux_targets() below,
+#: turns the direction into a baseline.py-only edit.
+#:
+#: APPEND ONLY. Indices 0..6 keep their current meaning: data.py, baseline.py and
+#: harness/_data.py all index these tuples POSITIONALLY, and evaluate.py's
+#: callers depend on x[6] being the label.
+AUX_SIGNALS = ['is_click', 'is_like', 'is_follow', 'is_comment', 'is_forward',
+               'play_time_ms']
+
+#: Where AUX_SIGNALS starts in a row tuple: after the original 7 fields.
+AUX_OFFSET = 7
+
+
+def _aux_value(r, col):
+    """One auxiliary signal off a CSV row, tolerating a missing column.
+
+    Fills 0 rather than raising, so the loader still works on a truncated or
+    hand-built dataset — the sandbox fixtures and several tests use cut-down
+    CSVs, and a KeyError here would break loading entirely for a signal a
+    candidate may not even use. Same '!= "0"' coercion as LABEL for the binary
+    signals; play_time_ms is continuous.
+    """
+    v = r.get(col)
+    if v is None or v == '':
+        return 0.0 if col == 'play_time_ms' else 0
+    if col == 'play_time_ms':
+        try:
+            return float(v)
+        except ValueError:
+            return 0.0
+    return 1 if v != '0' else 0
+
+
 def load(data_dir):
-    """读日志 + 视频侧特征，返回按划分切好的 dict。"""
+    """读日志 + 视频侧特征，返回按划分切好的 dict。
+
+    Row tuple layout: [0]=date, [1]=user_id, [2]=video_id, [3]=author_id,
+    [4]=tab, [5]=duration_ms, [6]=long_view label, then AUX_SIGNALS from
+    index AUX_OFFSET (=7) onward, in AUX_SIGNALS order.
+    """
     vid2author = {}
     with open(os.path.join(data_dir, 'video_features_basic_pure.csv')) as fh:
         for r in csv.DictReader(fh):
@@ -70,12 +120,49 @@ def load(data_dir):
             for r in csv.DictReader(fh):
                 rows.append((int(r['date']), r['user_id'], r['video_id'],
                              vid2author.get(r['video_id'], 'UNK'), r['tab'],
-                             float(r['duration_ms']), 1 if r[LABEL] != '0' else 0))
+                             float(r['duration_ms']), 1 if r[LABEL] != '0' else 0)
+                            + tuple(_aux_value(r, c) for c in AUX_SIGNALS))
 
     out = {}
     for name, (lo, hi) in SPLITS.items():
         out[name] = [x for x in rows if lo <= x[0] <= hi]
     return out
+
+def aux_targets(splits):
+    """Auxiliary TARGETS per split, aligned row-for-row with encode()'s X.
+
+    Returns {split_name: float32 (N, len(AUX_SIGNALS))}, column order matching
+    AUX_SIGNALS.
+
+    This is the single seam a baseline.py-only candidate needs, which is what
+    makes the multi-task direction reachable under the one-file rule: a
+    candidate adds an auxiliary head and a weighted term to the loss in
+    baseline.py and calls this for the labels, touching no other file.
+
+    ALIGNMENT. encode() iterates `for n, x in enumerate(rws)` over
+    splits[name], and so does this — so row n here is row n of X, for the SAME
+    splits dict. Pass the same object to both. Slicing or reordering a split
+    between the two calls silently misaligns targets against features.
+
+    THESE ARE TARGETS, NEVER INPUTS. The value for the row being scored is that
+    row's own outcome; putting it in the feature matrix leaks the label.
+    codegen/gate.py blocks it statically, both by signal name and by this
+    function's name.
+
+    Rows shorter than AUX_OFFSET + len(AUX_SIGNALS) yield zeros rather than
+    raising, so hand-built 7-tuples in tests still work.
+    """
+    n_aux = len(AUX_SIGNALS)
+    out = {}
+    for name, rws in splits.items():
+        A = np.zeros((len(rws), n_aux), dtype=np.float32)
+        for n, x in enumerate(rws):
+            vals = x[AUX_OFFSET:AUX_OFFSET + n_aux]
+            if len(vals) == n_aux:
+                A[n] = vals
+        out[name] = A
+    return out
+
 
 def _bucket_edges(durations, n=10):
     return np.quantile(np.asarray(durations), np.linspace(0, 1, n + 1)[1:-1])

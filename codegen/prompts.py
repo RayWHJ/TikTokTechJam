@@ -23,7 +23,12 @@ HARD RULES (a static gate rejects any diff that violates these, before it runs):
    from_pretrained, transformers, torch.hub, load_dataset, network downloads).
 4. Same-row auxiliary signals (is_click, is_like, is_follow, is_comment,
    is_forward, play_time_ms) may be used ONLY as auxiliary LOSS TARGETS, never
-   fed into the model as an input feature array.
+   fed into the model as an input feature array. They are already plumbed:
+   data.aux_targets(splits) returns, per split, a float32
+   (N, len(AUX_SIGNALS)) array aligned row-for-row with encode()'s X, so a
+   multi-task head is a baseline.py-only change. Putting that array into X, a
+   column_stack, or FIELDS is the leak the gate blocks; passing it as the
+   target of an auxiliary loss term is the intended use.
 Output ONLY a unified diff in a ```diff fenced block. No prose outside it."""
 
 # Diff-format rules. A patch that does not apply is a wasted iteration, and the
