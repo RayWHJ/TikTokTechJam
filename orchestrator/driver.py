@@ -254,6 +254,12 @@ def _rebuild_node(rec: dict) -> Node:
     n.per_user_by_seed = {int(k): v for k, v in puw.items()}
     psp = rec.get("per_seed_primary") or {}
     n.per_seed_primary = {int(k): float(v) for k, v in psp.items()}
+    psg = rec.get("per_seed_gauc") or {}
+    n.per_seed_gauc = {int(k): (float(v) if v is not None else None)
+                       for k, v in psg.items()}
+    psn = rec.get("per_seed_ndcg5") or {}
+    n.per_seed_ndcg5 = {int(k): (float(v) if v is not None else None)
+                        for k, v in psn.items()}
     n.seeds_run = list(rec.get("seeds_run") or n.per_seed_primary.keys())
     return n
  
@@ -460,6 +466,16 @@ def _scalar_primary(c: Node) -> float:
         return sum(c.per_seed_primary.values()) / len(c.per_seed_primary)
     return _best_primary(c)
 
+def _scalar_gauc(c: Node) -> float | None:
+    """Mean GAUC across the seeds this candidate actually ran, or None."""
+    vals = [v for v in c.per_seed_gauc.values() if v is not None]
+    return sum(vals) / len(vals) if vals else None
+
+
+def _scalar_ndcg5(c: Node) -> float | None:
+    """Mean nDCG@5 across the seeds this candidate actually ran, or None."""
+    vals = [v for v in c.per_seed_ndcg5.values() if v is not None]
+    return sum(vals) / len(vals) if vals else None
 
 def _is_no_op(cand: Node, parent: Node, seed: int) -> bool:
     """True if the candidate reproduced its parent's per-user scores exactly.
@@ -519,6 +535,8 @@ def _append_nodes_log(candidates: List[Node], iter_no: int,
                 "hypothesis": c.hypothesis,
                 "diagnosis": c.diagnosis,
                 "per_seed_primary": c.per_seed_primary,
+                "per_seed_gauc": c.per_seed_gauc,
+                "per_seed_ndcg5": c.per_seed_ndcg5,
                 "mean_delta": c.mean_delta,
                 "p_positive": c.p_positive,
                 "lower_95": c.lower_95,
@@ -882,6 +900,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
             # same measurement, and reading the file without it hides that.
             "candidates": [{"id": c.id,
                             "primary": s if s > float("-inf") else None,
+                            "gauc": _scalar_gauc(c),
+                            "ndcg5": _scalar_ndcg5(c),
                             "n_seeds": len(c.per_seed_primary),
                             "mean_delta": c.mean_delta,
                             "p_positive": c.p_positive,
@@ -894,8 +914,16 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
         if verbose:
             rec = iter_records[-1]
             if rec["n_scored"]:
+                def _fmt_cand(c):
+                    g = c.get("gauc")
+                    n = c.get("ndcg5")
+                    metrics = f"{c['primary']:.4f}"
+                    if g is not None and n is not None:
+                        metrics += f" (GAUC={g:.4f}/NDCG@5={n:.4f})"
+                    return f"{c['id']}={metrics}/{c['n_seeds']} seeds"
+                
                 scores_str = ", ".join(
-                    f"{c['id']}={c['primary']:.4f}/{c['n_seeds']}s"
+                    _fmt_cand(c)
                     for c in sorted((c for c in rec["candidates"]
                                      if c["primary"] is not None),
                                     key=lambda c: -c["primary"]))
@@ -904,8 +932,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 delta_str = ("" if rec["best_mean_delta"] is None else
                              f" | best paired delta {rec['best_mean_delta']:+.4f}")
                 print(f"[iter {it}] iter_primary={rec['iter_primary']:.4f} "
-                      f"({rec['curr_vs_baseline']:+.4f} vs baseline)"
-                      f"({rec['curr_vs_champion']:+.4f} vs champion)"
+                      f"({rec['curr_vs_baseline']:+.4f} vs baseline,"
+                      f" {rec['curr_vs_champion']:+.4f} vs champion)"
                       f"{delta_str} | candidates: {scores_str}")
             else:
                 # Say why there's no score, else "n/a" is unreadable in run.log.
@@ -1202,6 +1230,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
 
             c.partial_scores.append(res["metrics"]["primary"])
             c.per_seed_primary[0] = res["metrics"]["primary"]
+            c.per_seed_gauc[0] = res["metrics"].get("GAUC")
+            c.per_seed_ndcg5[0] = res["metrics"].get("nDCG@5")
             c.per_user_by_seed[0] = res["metrics"].get("per_user", {})
             return "ok"
 
@@ -1264,6 +1294,8 @@ def run(max_iters: int = 50, wallclock_cap_s: int = 6 * 3600, verbose: bool = Tr
                 if r["status"] == "ok":
                     c.seeds_run.append(seed)
                     c.per_seed_primary[seed] = r["metrics"]["primary"]
+                    c.per_seed_gauc[seed] = r["metrics"].get("GAUC")
+                    c.per_seed_ndcg5[seed] = r["metrics"].get("nDCG@5")
                     c.per_user_by_seed[seed] = r["metrics"].get("per_user", {})
             c.local_best_score = _scalar_primary(c)
 

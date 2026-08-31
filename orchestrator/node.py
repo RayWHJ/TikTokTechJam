@@ -49,6 +49,12 @@ class Node:
     # see driver._scalar_primary for the arithmetic on the real cached baseline.
     per_seed_primary: Dict[int, float] = field(default_factory=dict)
 
+    # Per-seed GAUC and nDCG@5, kept alongside primary so run-logs can report
+    # the components a primary was averaged from. Populated by the same paths
+    # that populate per_seed_primary.
+    per_seed_gauc: Dict[int, float] = field(default_factory=dict)
+    per_seed_ndcg5: Dict[int, float] = field(default_factory=dict)
+
     # Paired candidate-vs-parent statistics from promotion.bootstrap_delta.
     # Cached on the node so progress.json can report WHY a candidate was kept or
     # dropped instead of only its noisy absolute score.
