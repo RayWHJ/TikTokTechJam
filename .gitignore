@@ -1,0 +1,13 @@
+KuaiRand-Pure.tar.gz
+KuaiRand-Pure/data/
+__pycache__/
+*.pyc
+.harness_cache/
+.llm_calls_cache/
+.pytest_cache/
+.venv/
+orchestrator/_state/
+.env
+bundle_code.py
+bundle_code.html
+FIX_PLAN.md

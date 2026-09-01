@@ -1,0 +1,359 @@
+"""
+Standalone test harness for llm_calls.
+
+None of these tests make real API calls — they monkeypatch the model-call
+functions (call_model_text / call_model_with_search) at the point each
+contract function imports them, so we can verify schema validation and
+retry logic entirely offline, with hand-written fake inputs, independent
+of anyone else's module.
+
+Run with:  pytest tests/test_harness.py -v
+       or: python tests/test_harness.py
+"""
+
+import importlib
+import json
+import sys
+from pathlib import Path
+
+import pytest
+
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
+# NOTE: llm_calls/__init__.py does `from .diagnose import diagnose` and
+# `from .audit import audit` — those function names collide with their own
+# submodule names, so `from llm_calls import diagnose` would actually grab
+# the *function*, not the module, and monkeypatching would silently no-op.
+# importlib.import_module sidesteps that by fetching straight from
+# sys.modules instead of via attribute lookup on the package.
+diagnose_mod = importlib.import_module("llm_calls.diagnose")
+audit_mod = importlib.import_module("llm_calls.audit")
+
+from llm_calls import literature as literature_mod
+from llm_calls import hypothesis as hypothesis_mod
+from llm_calls.exceptions import LLMSchemaError
+
+
+def _make_sequenced_call_fn(responses):
+    """Returns a fn(prompt) -> str that pops responses off the front of
+    `responses` in order, and records how many times it was called."""
+    calls = {"count": 0, "prompts": []}
+
+    def fn(prompt: str) -> str:
+        calls["count"] += 1
+        calls["prompts"].append(prompt)
+        idx = min(calls["count"] - 1, len(responses) - 1)
+        return responses[idx]
+
+    fn.calls = calls
+    return fn
+
+
+# ---------------------------------------------------------------------------
+# diagnose()
+# ---------------------------------------------------------------------------
+
+FAKE_NODE_CONTEXT = {
+    "node_id": "n42",
+    "parent_id": "n17",
+    "history": [
+        {"config": "FM baseline", "gauc": 0.5946, "ndcg5": 0.301},
+        {"config": "FM + tab embedding", "gauc": 0.5951, "ndcg5": 0.303},
+        {"config": "FM + tab + dur_bucket cross", "gauc": 0.5953, "ndcg5": 0.304},
+    ],
+    "notes": "three consecutive small feature-crossing edits, gains shrinking each time",
+}
+
+VALID_DIAGNOSIS_JSON = json.dumps({
+    "bottleneck": "No modeling of user interaction sequence; all features are static IDs.",
+    "evidence": "Gains from additional static feature crosses are shrinking across 3 nodes.",
+    "confidence": 0.72,
+    "component": "feature_engineering",
+    "edit_radius": "large",
+    "expected_cost": "moderate — needs a sequence input pipeline",
+    "incompatibilities": [],
+    "uncertainty": 0.3,
+})
+
+MALFORMED_JSON = "Sure, here's my diagnosis: {bottleneck: no quotes, this is not valid json"
+
+
+def test_diagnose_retries_then_succeeds(monkeypatch):
+    call_fn = _make_sequenced_call_fn([MALFORMED_JSON, VALID_DIAGNOSIS_JSON])
+    monkeypatch.setattr(diagnose_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = diagnose_mod.diagnose(FAKE_NODE_CONTEXT)
+
+    assert call_fn.calls["count"] == 2, "should have retried exactly once before succeeding"
+    assert result["bottleneck"].startswith("No modeling")
+    assert 0.0 <= result["confidence"] <= 1.0
+    assert result["edit_radius"] in ("small", "large")
+    # second prompt should include the validation error so the model can self-correct
+    assert "Validation error" in call_fn.calls["prompts"][1]
+
+
+def test_diagnose_exhausts_retries_raises_typed_exception(monkeypatch):
+    call_fn = _make_sequenced_call_fn([MALFORMED_JSON])  # always malformed
+    monkeypatch.setattr(diagnose_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    with pytest.raises(LLMSchemaError) as exc_info:
+        diagnose_mod.diagnose(FAKE_NODE_CONTEXT)
+
+    assert exc_info.value.attempts == 3  # 1 initial + 2 retries
+    assert exc_info.value.last_raw_response == MALFORMED_JSON
+
+
+def test_diagnose_rejects_out_of_range_confidence(monkeypatch):
+    bad = json.dumps({**json.loads(VALID_DIAGNOSIS_JSON), "confidence": 1.5})
+    good = VALID_DIAGNOSIS_JSON
+    call_fn = _make_sequenced_call_fn([bad, good])
+    monkeypatch.setattr(diagnose_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = diagnose_mod.diagnose(FAKE_NODE_CONTEXT)
+    assert call_fn.calls["count"] == 2
+    assert result["confidence"] == 0.72
+
+
+# ---------------------------------------------------------------------------
+# ground_in_literature()
+# ---------------------------------------------------------------------------
+
+VALID_LITERATURE_JSON = json.dumps({
+    "mechanism": "SIM models long user-history sequences via a two-stage search-then-attend approach.",
+    "assumptions": ["user has enough history length to benefit from sequence modeling"],
+    "contradictory_findings": ["reported gains shrink substantially on cold-start-heavy slices"],
+    "dataset_compatibility": ["KuaiRand-Pure has user_id and video_id sequences usable for this"],
+    "implementation_cost": "high — needs a new input pipeline for sequential features",
+    "primary_citation": "Pi et al., 'Search-based User Interest Modeling', CIKM 2020",
+})
+
+
+@pytest.fixture
+def isolated_literature_cache(tmp_path, monkeypatch):
+    """Point the module's cache at a throwaway temp file and reset the
+    in-memory cache, so tests don't interfere with each other or with a
+    real cache on disk."""
+    cache_path = tmp_path / "literature_cache.json"
+    monkeypatch.setattr(literature_mod, "_CACHE_DIR", str(tmp_path))
+    monkeypatch.setattr(literature_mod, "_CACHE_PATH", str(cache_path))
+    monkeypatch.setattr(literature_mod, "_memory_cache", None)
+    yield
+
+
+def test_ground_in_literature_caches_repeat_lookups(monkeypatch, isolated_literature_cache):
+    call_fn = _make_sequenced_call_fn([VALID_LITERATURE_JSON])
+    monkeypatch.setattr(literature_mod, "call_model_with_search",
+                         lambda system, p, model=None, **kw: call_fn(p))
+
+    result1 = literature_mod.ground_in_literature("no sequence modeling of user history")
+    result2 = literature_mod.ground_in_literature("No Sequence Modeling Of User History  ")  # different case/whitespace
+
+    assert call_fn.calls["count"] == 1, "second lookup should hit the cache, not call the model again"
+    assert result1 == result2
+
+
+def test_ground_in_literature_different_bottleneck_not_cached_together(monkeypatch, isolated_literature_cache):
+    call_fn = _make_sequenced_call_fn([VALID_LITERATURE_JSON, VALID_LITERATURE_JSON])
+    monkeypatch.setattr(literature_mod, "call_model_with_search",
+                         lambda system, p, model=None, **kw: call_fn(p))
+
+    literature_mod.ground_in_literature("bottleneck A")
+    literature_mod.ground_in_literature("bottleneck B")
+
+    assert call_fn.calls["count"] == 2
+
+
+# ---------------------------------------------------------------------------
+# generate_hypothesis()
+# ---------------------------------------------------------------------------
+
+HIGH_CONFIDENCE_DIAGNOSIS = {**json.loads(VALID_DIAGNOSIS_JSON), "confidence": 0.9}
+LOW_CONFIDENCE_DIAGNOSIS = {**json.loads(VALID_DIAGNOSIS_JSON), "confidence": 0.2}
+PLATEAU_DIAGNOSIS = {**json.loads(VALID_DIAGNOSIS_JSON), "confidence": 0.9,
+                     "evidence": "metric has plateaued across the last 5 nodes"}
+FAKE_EVIDENCE_CARD = json.loads(VALID_LITERATURE_JSON)
+
+
+#: Families cycled through so a multi-hypothesis batch is family-DIVERSE, which
+#: validate_hypothesis_list now requires: a batch that is one family wide is one
+#: experiment run several times.
+_FIXTURE_FAMILIES = ("sequence_features", "bpr_pairwise", "multitask_auxiliary",
+                     "negative_sampling", "listwise_softmax", "gbdt_swap",
+                     "ensemble_blend", "watchtime_censored",
+                     "capacity_or_regularization")
+
+
+def _fake_hypothesis(n=1):
+    return {
+        "mechanism": f"mechanism #{n}: adding sequence attention over user history should help ranking",
+        "success_criterion_paired": "nDCG@5 on val-tier-2 improves by at least +0.005 over the parent node",
+        "implementation_sketch": "add a DIN-style attention layer over the last 20 user_id interactions",
+        # Required since T2.6. Declared rather than guessed from the prose,
+        # which used to put "a pairwise loss over user history" in the loss
+        # bucket because loss families are checked first.
+        "mechanism_family": _FIXTURE_FAMILIES[(n - 1) % len(_FIXTURE_FAMILIES)],
+    }
+
+
+def _batch(n):
+    """n schema-valid hypotheses, each in a DIFFERENT family."""
+    return json.dumps([_fake_hypothesis(i + 1) for i in range(n)])
+
+
+def test_generate_hypothesis_confident_still_requests_a_whole_batch(monkeypatch):
+    """T2.7. This used to assert a count of 1: `_decide_count` returned 1 unless
+    confidence < 0.5, so the search was a CHAIN rather than a tree — and with a
+    batch of one, the probability of starving an iteration equals the probability
+    that one family is banned, which is exactly how iteration 4 of the recorded
+    run produced zero candidates.
+
+    A hypothesis is ~300 output tokens; a candidate is a writer call, an audit
+    call and a triage run. Widening the proposal distribution is two orders of
+    magnitude cheaper than widening the compute bill, and the execution cap
+    (driver.MAX_CANDIDATES_PER_ITER) is what holds the bill down.
+    """
+    n = hypothesis_mod.HYPOTHESES_MIN
+    call_fn = _make_sequenced_call_fn([_batch(n)])
+    monkeypatch.setattr(hypothesis_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = hypothesis_mod.generate_hypothesis(HIGH_CONFIDENCE_DIAGNOSIS, FAKE_EVIDENCE_CARD)
+
+    assert len(result) == n == 6
+    assert f"exactly {n}" in call_fn.calls["prompts"][0]
+    # And the batch is required to be family-diverse, or it is one experiment
+    # run n times — 4 of the 5 candidates in the recorded run were one idea.
+    assert "DIFFERENT families" in call_fn.calls["prompts"][0]
+
+
+def test_generate_hypothesis_low_confidence_requests_the_wider_batch(monkeypatch):
+    n = hypothesis_mod.HYPOTHESES_MAX
+    call_fn = _make_sequenced_call_fn([_batch(n)])
+    monkeypatch.setattr(hypothesis_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = hypothesis_mod.generate_hypothesis(LOW_CONFIDENCE_DIAGNOSIS, FAKE_EVIDENCE_CARD)
+
+    assert len(result) == n == 8
+    assert f"exactly {n}" in call_fn.calls["prompts"][0]
+
+
+def test_generate_hypothesis_plateau_text_also_requests_the_wider_batch(monkeypatch):
+    n = hypothesis_mod.HYPOTHESES_MAX
+    call_fn = _make_sequenced_call_fn([_batch(n)])
+    monkeypatch.setattr(hypothesis_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = hypothesis_mod.generate_hypothesis(PLATEAU_DIAGNOSIS, FAKE_EVIDENCE_CARD)
+
+    assert len(result) == n
+
+
+def test_the_requested_count_is_clamped_by_the_families_available(monkeypatch):
+    """Asking for more distinct families than exist is an instruction the model
+    cannot satisfy — it would burn the whole retry budget failing the diversity
+    check."""
+    only_two = ["bpr_pairwise", "sequence_features"]
+    blocked = [f for f in hypothesis_mod.LEGAL_DECLARATIONS
+               if f not in only_two and f != hypothesis_mod.OTHER]
+    # The reply has to use only families that are still legal, or the schema
+    # rejects it for the ban rather than for the count.
+    reply = json.dumps([{**_fake_hypothesis(1), "mechanism_family": fam}
+                        for fam in only_two + [hypothesis_mod.OTHER]])
+    call_fn = _make_sequenced_call_fn([reply])
+    monkeypatch.setattr(hypothesis_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = hypothesis_mod.generate_hypothesis(
+        LOW_CONFIDENCE_DIAGNOSIS, FAKE_EVIDENCE_CARD, blocked_families=blocked)
+    # 2 legal families + `other`, which may repeat — not HYPOTHESES_MAX.
+    assert len(result) == 3
+    assert "exactly 3" in call_fn.calls["prompts"][0]
+
+
+def test_generate_hypothesis_rejects_flat_absolute_threshold(monkeypatch):
+    n = hypothesis_mod.HYPOTHESES_MIN
+    bad = [_fake_hypothesis(i + 1) for i in range(n)]
+    bad[0]["success_criterion_paired"] = "nDCG@5 reaches 0.35"  # flat threshold, no delta/tier language
+    bad_response = json.dumps(bad)
+    good_response = _batch(n)
+    call_fn = _make_sequenced_call_fn([bad_response, good_response])
+    monkeypatch.setattr(hypothesis_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = hypothesis_mod.generate_hypothesis(HIGH_CONFIDENCE_DIAGNOSIS, FAKE_EVIDENCE_CARD)
+
+    assert call_fn.calls["count"] == 2, "flat threshold should be rejected and trigger a retry"
+    assert "val-tier-2" in result[0]["success_criterion_paired"]
+
+
+def test_generate_hypothesis_wrong_array_length_triggers_retry(monkeypatch):
+    n = hypothesis_mod.HYPOTHESES_MIN
+    wrong_length = _batch(n - 1)        # asked for n, got n-1
+    correct_length = _batch(n)
+    call_fn = _make_sequenced_call_fn([wrong_length, correct_length])
+    monkeypatch.setattr(hypothesis_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = hypothesis_mod.generate_hypothesis(HIGH_CONFIDENCE_DIAGNOSIS, FAKE_EVIDENCE_CARD)
+
+    assert call_fn.calls["count"] == 2
+    assert len(result) == n
+
+
+# ---------------------------------------------------------------------------
+# audit()
+# ---------------------------------------------------------------------------
+
+FAKE_DIFF = """
+--- a/train.py
++++ b/train.py
+@@
+-    df['feat'] = df.groupby('user_id')['long_view'].transform('mean')
++    df['feat'] = df.groupby('user_id')['long_view'].transform('mean')  # computed on train+test combined
+"""
+
+FAKE_CHECKLIST = {
+    "test_label_access": True,
+    "temporal_causality": True,
+}
+
+VALID_AUDIT_FAIL_JSON = json.dumps({
+    "pass": False,
+    "violations": ["test_label_access: aggregate is computed over train+test combined, leaking test labels"],
+    "notes": "",
+})
+
+VALID_AUDIT_PASS_JSON = json.dumps({"pass": True, "violations": [], "notes": ""})
+
+CONTRADICTORY_AUDIT_JSON = json.dumps({"pass": True, "violations": ["something"], "notes": ""})
+
+
+def test_audit_detects_violation(monkeypatch):
+    call_fn = _make_sequenced_call_fn([VALID_AUDIT_FAIL_JSON])
+    monkeypatch.setattr(audit_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = audit_mod.audit(FAKE_DIFF, FAKE_CHECKLIST)
+
+    assert result["pass"] is False
+    assert len(result["violations"]) == 1
+    # confirm the diff and checklist made it into the prompt, and nothing else did
+    prompt = call_fn.calls["prompts"][0]
+    assert "long_view" in prompt
+    assert "test_label_access" in prompt
+
+
+def test_audit_clean_diff_passes(monkeypatch):
+    call_fn = _make_sequenced_call_fn([VALID_AUDIT_PASS_JSON])
+    monkeypatch.setattr(audit_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = audit_mod.audit("+ df['feat'] = df['dur_bucket']", {"external_data_rule": True})
+
+    assert result["pass"] is True
+    assert result["violations"] == []
+
+
+def test_audit_contradictory_response_triggers_retry(monkeypatch):
+    call_fn = _make_sequenced_call_fn([CONTRADICTORY_AUDIT_JSON, VALID_AUDIT_FAIL_JSON])
+    monkeypatch.setattr(audit_mod, "call_model_text", lambda system, p, model=None, **kw: call_fn(p))
+
+    result = audit_mod.audit(FAKE_DIFF, FAKE_CHECKLIST)
+
+    assert call_fn.calls["count"] == 2, "pass=true with non-empty violations should be rejected as contradictory"
+    assert result["pass"] is False
+
+

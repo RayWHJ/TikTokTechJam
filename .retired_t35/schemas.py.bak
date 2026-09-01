@@ -1,0 +1,446 @@
+"""
+Hand-rolled schema validation — deliberately no jsonschema dependency, so
+this module has zero install requirements beyond the anthropic SDK itself.
+
+Every validate_* function takes a parsed dict/list (already JSON-decoded)
+and either returns a cleaned copy (numeric coercion, key-stripping) or
+raises ValueError with a message specific enough to be useful when it gets
+appended back into a retry prompt.
+"""
+
+from __future__ import annotations
+
+from typing import Any, Dict, List
+
+from .families import LEGAL_DECLARATIONS, OTHER, normalise_declaration
+
+
+def _require_dict(obj: Any) -> Dict:
+    if not isinstance(obj, dict):
+        raise ValueError(f"Expected a JSON object, got {type(obj).__name__}.")
+    return obj
+
+
+def _require_keys(d: Dict, keys: List[str]) -> None:
+    missing = [k for k in keys if k not in d]
+    if missing:
+        raise ValueError(f"Missing required key(s): {missing}. Present keys: {list(d.keys())}.")
+
+
+def _reject_unknown_keys(d: Dict, allowed: List[str]) -> None:
+    extra = [k for k in d.keys() if k not in allowed]
+    if extra:
+        raise ValueError(f"Unexpected extra key(s): {extra}. Allowed keys: {allowed}.")
+
+
+def _check_str(d: Dict, key: str) -> str:
+    val = d[key]
+    if not isinstance(val, str) or not val.strip():
+        raise ValueError(f"Field '{key}' must be a non-empty string, got {val!r}.")
+    return val
+
+
+def _check_float01(d: Dict, key: str) -> float:
+    val = d[key]
+    if isinstance(val, bool) or not isinstance(val, (int, float)):
+        raise ValueError(f"Field '{key}' must be a number between 0 and 1, got {val!r}.")
+    val = float(val)
+    if not (0.0 <= val <= 1.0):
+        raise ValueError(f"Field '{key}' must be between 0 and 1 inclusive, got {val}.")
+    return val
+
+
+def _check_bool(d: Dict, key: str) -> bool:
+    val = d[key]
+    if not isinstance(val, bool):
+        raise ValueError(f"Field '{key}' must be a boolean, got {val!r}.")
+    return val
+
+
+def _check_list_of_str(d: Dict, key: str) -> List[str]:
+    val = d[key]
+    if not isinstance(val, list) or not all(isinstance(v, str) for v in val):
+        raise ValueError(f"Field '{key}' must be a list of strings, got {val!r}.")
+    return val
+
+
+def _check_enum(d: Dict, key: str, allowed: List[str]) -> str:
+    val = d[key]
+    if val not in allowed:
+        raise ValueError(f"Field '{key}' must be one of {allowed}, got {val!r}.")
+    return val
+
+
+# ---------------------------------------------------------------------------
+# diagnose()
+# ---------------------------------------------------------------------------
+
+_DIAGNOSIS_KEYS = [
+    "bottleneck", "evidence", "confidence", "component",
+    "edit_radius", "expected_cost", "incompatibilities", "uncertainty",
+]
+
+
+def validate_diagnosis(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _DIAGNOSIS_KEYS)
+    _reject_unknown_keys(d, _DIAGNOSIS_KEYS)
+    return {
+        "bottleneck": _check_str(d, "bottleneck"),
+        "evidence": _check_str(d, "evidence"),
+        "confidence": _check_float01(d, "confidence"),
+        "component": _check_str(d, "component"),
+        "edit_radius": _check_enum(d, "edit_radius", ["small", "large"]),
+        "expected_cost": _check_str(d, "expected_cost"),
+        "incompatibilities": _check_list_of_str(d, "incompatibilities"),
+        "uncertainty": _check_float01(d, "uncertainty"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# ground_in_literature()
+# ---------------------------------------------------------------------------
+
+_LITERATURE_KEYS = [
+    "mechanism", "assumptions", "contradictory_findings",
+    "dataset_compatibility", "implementation_cost", "primary_citation",
+]
+
+
+def validate_literature(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _LITERATURE_KEYS)
+    _reject_unknown_keys(d, _LITERATURE_KEYS)
+    return {
+        "mechanism": _check_str(d, "mechanism"),
+        "assumptions": _check_list_of_str(d, "assumptions"),
+        "contradictory_findings": _check_list_of_str(d, "contradictory_findings"),
+        "dataset_compatibility": _check_list_of_str(d, "dataset_compatibility"),
+        "implementation_cost": _check_str(d, "implementation_cost"),
+        "primary_citation": _check_str(d, "primary_citation"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# generate_hypothesis()
+# ---------------------------------------------------------------------------
+
+_HYPOTHESIS_KEYS = ["mechanism", "success_criterion_paired",
+                    "implementation_sketch", "mechanism_family"]
+
+# Heuristic only: flags hypotheses that look like a flat absolute threshold
+# rather than a candidate-minus-parent delta on a named tier. This is a
+# best-effort lint, not a guarantee — tune the keyword lists if you see
+# false positives/negatives in practice.
+_DELTA_INDICATORS = ["delta", "improve", "increase", "over the parent", "vs. parent",
+                      "vs parent", "relative to parent", "compared to parent", "+", "-"]
+_TIER_INDICATORS = ["tier", "val-", "validation", "fold", "split"]
+
+
+def _check_success_criterion(value: str) -> str:
+    lowered = value.lower()
+    has_delta_language = any(tok in lowered for tok in _DELTA_INDICATORS)
+    has_tier_reference = any(tok in lowered for tok in _TIER_INDICATORS)
+    if not has_delta_language:
+        raise ValueError(
+            f"success_criterion_paired ({value!r}) doesn't read as a candidate-minus-parent "
+            f"delta claim (no comparison language found). It must compare against the parent, "
+            f"not state a flat absolute threshold."
+        )
+    if not has_tier_reference:
+        raise ValueError(
+            f"success_criterion_paired ({value!r}) doesn't name a validation tier/split. "
+            f"It must specify which validation tier the comparison is measured on."
+        )
+    return value
+
+
+def _check_mechanism_family(d: Dict, blocked: Any = None) -> str:
+    """Validate the DECLARED family, and refuse a currently-blocked one.
+
+    Enforcement lives here rather than in the driver's dedup filter because a
+    retry loop already exists at this layer: a rejected value goes back to the
+    model with the reason appended (`call_with_schema_retry`), so the proposer
+    gets one more chance to pick a legal family. The driver's filter had no such
+    loop — it silently deleted the hypothesis, which is how iteration 4 of the
+    recorded run returned zero candidates from three proposals.
+
+    An unrecognised family is LEGAL. The taxonomy is a dedup aid, not a menu of
+    permitted ideas, and bucketing a novel mechanism into the nearest known
+    family is how it inherits a ban it has nothing to do with.
+    """
+    raw = _check_str(d, "mechanism_family")
+    value = normalise_declaration(raw)
+    if value is None:
+        raise ValueError(
+            f"mechanism_family ({raw!r}) is not a usable name. Use one of "
+            f"{list(LEGAL_DECLARATIONS)}, or {OTHER!r} for a mechanism that "
+            f"fits none of them.")
+    for fam in (blocked or ()):
+        if value == fam:
+            raise ValueError(
+                f"mechanism_family {value!r} has already been REFUTED in this "
+                f"run and is blocked. Propose in a different family. Blocked: "
+                f"{sorted(blocked)}. Legal: "
+                f"{[f for f in LEGAL_DECLARATIONS if f not in set(blocked)]}.")
+    return value
+
+
+def validate_hypothesis_item(parsed: Any, blocked_families: Any = None) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _HYPOTHESIS_KEYS)
+    _reject_unknown_keys(d, _HYPOTHESIS_KEYS)
+    return {
+        "mechanism": _check_str(d, "mechanism"),
+        "success_criterion_paired": _check_success_criterion(_check_str(d, "success_criterion_paired")),
+        "implementation_sketch": _check_str(d, "implementation_sketch"),
+        "mechanism_family": _check_mechanism_family(d, blocked_families),
+    }
+
+
+# ---------------------------------------------------------------------------
+# refine()  — MLE-STAR component refinement
+# ---------------------------------------------------------------------------
+
+#: A refinement is a hypothesis plus the component it is scoped to. Named
+#: validate_refinement rather than validate_hypothesis so it can't be confused
+#: with validate_hypothesis_item, which rejects the extra `component` key.
+_REFINEMENT_KEYS = _HYPOTHESIS_KEYS + ["component"]
+
+
+def validate_refinement(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _REFINEMENT_KEYS)
+    _reject_unknown_keys(d, _REFINEMENT_KEYS)
+    return {
+        "mechanism": _check_str(d, "mechanism"),
+        "success_criterion_paired": _check_success_criterion(
+            _check_str(d, "success_criterion_paired")),
+        "implementation_sketch": _check_str(d, "implementation_sketch"),
+        "component": _check_str(d, "component"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# verdict()  — grade a measurement against the criterion it declared
+# ---------------------------------------------------------------------------
+
+_VERDICT_KEYS = ["verdict", "criterion_was_calibrated", "reason", "next_action"]
+
+_VERDICTS = ["met", "missed_but_promising", "refuted", "not_tested"]
+_NEXT_ACTIONS = ["retry_cheaper", "adjust_magnitude", "abandon_mechanism",
+                 "build_on_it"]
+
+
+def validate_verdict(parsed: Any) -> Dict:
+    """Validate a verdict, and reject the two combinations that are incoherent.
+
+    The cross-field checks are the point of this validator, not decoration.
+    "refuted" + criterion_was_calibrated=false says the mechanism was condemned
+    for missing a bar the grader itself judged unreachable, which is exactly the
+    failure the verdict step exists to prevent. And "not_tested" +
+    abandon_mechanism would hard-block a family that was never measured — a
+    permanent decision made on no evidence.
+    """
+    d = _require_dict(parsed)
+    _require_keys(d, _VERDICT_KEYS)
+    _reject_unknown_keys(d, _VERDICT_KEYS)
+    out = {
+        "verdict": _check_enum(d, "verdict", _VERDICTS),
+        "criterion_was_calibrated": _check_bool(d, "criterion_was_calibrated"),
+        "reason": _check_str(d, "reason"),
+        "next_action": _check_enum(d, "next_action", _NEXT_ACTIONS),
+    }
+    if out["verdict"] == "refuted" and not out["criterion_was_calibrated"]:
+        raise ValueError(
+            "verdict='refuted' with criterion_was_calibrated=false is "
+            "incoherent: a mechanism cannot be refuted for missing a criterion "
+            "you judged uncalibrated. Use 'missed_but_promising' instead.")
+    if out["verdict"] == "not_tested" and out["next_action"] == "abandon_mechanism":
+        raise ValueError(
+            "verdict='not_tested' with next_action='abandon_mechanism' is "
+            "incoherent: abandoning is a permanent block on the mechanism "
+            "family, and this mechanism was never measured. Use "
+            "'retry_cheaper'.")
+    return out
+
+
+def validate_hypothesis_list(parsed: Any, expected_count: int,
+                             blocked_families: Any = None,
+                             require_distinct_families: bool = False
+                             ) -> List[Dict]:
+    # Two accepted shapes, on purpose. Structured outputs requires an OBJECT at
+    # the schema root, so the enforced path returns {"hypotheses": [...]}; a
+    # caller without enforcement (a test stub, a model that does not support it)
+    # returns a bare array. Unwrapping here rather than at the call site means
+    # both paths converge before any validation runs.
+    if isinstance(parsed, dict) and HYPOTHESES_KEY in parsed:
+        parsed = parsed[HYPOTHESES_KEY]
+    if not isinstance(parsed, list):
+        raise ValueError(
+            f"Expected a JSON array of hypotheses, or an object with a "
+            f"{HYPOTHESES_KEY!r} array, got {type(parsed).__name__}.")
+    if len(parsed) != expected_count:
+        raise ValueError(f"Expected exactly {expected_count} hypothesis object(s), got {len(parsed)}.")
+    items = [validate_hypothesis_item(item, blocked_families)
+             for item in parsed]
+    if require_distinct_families and len(items) > 1:
+        # Batch DIVERSITY, enforced here so the retry loop can ask again.
+        # 4 of the 5 candidates in the recorded run were the same idea
+        # (prev_video_id / prev_author_id / prev_long_view /
+        # session_depth); a batch that is one family wide is a batch of
+        # one experiment. `other` is exempt: it is the free-text hatch and
+        # two `other`s need not be the same idea.
+        named = [i["mechanism_family"] for i in items
+                 if i["mechanism_family"] != OTHER]
+        dupes = {f for f in named if named.count(f) > 1}
+        if dupes:
+            raise ValueError(
+                f"mechanism_family must be DISTINCT across the batch; "
+                f"{sorted(dupes)} appears more than once. Each hypothesis "
+                f"must attack a different family, or the batch measures "
+                f"one idea several times.")
+    return items
+
+
+# ---------------------------------------------------------------------------
+# audit()
+# ---------------------------------------------------------------------------
+
+_AUDIT_KEYS = ["pass", "violations", "notes"]
+
+
+def validate_audit(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _AUDIT_KEYS)
+    _reject_unknown_keys(d, _AUDIT_KEYS)
+    pass_val = _check_bool(d, "pass")
+    violations = _check_list_of_str(d, "violations")
+    if pass_val and violations:
+        raise ValueError("'pass' is true but 'violations' is non-empty — these are contradictory.")
+    if not pass_val and not violations:
+        raise ValueError("'pass' is false but 'violations' is empty — must list at least one violated key.")
+    notes = d["notes"]
+    if not isinstance(notes, str):
+        raise ValueError(f"Field 'notes' must be a string (may be empty), got {notes!r}.")
+    return {"pass": pass_val, "violations": violations, "notes": notes}
+
+
+# ---------------------------------------------------------------------------
+# dedup_fingerprint_match() escalation
+# ---------------------------------------------------------------------------
+
+_DEDUP_KEYS = ["duplicate", "reasoning"]
+
+
+def validate_dedup(parsed: Any) -> Dict:
+    d = _require_dict(parsed)
+    _require_keys(d, _DEDUP_KEYS)
+    _reject_unknown_keys(d, _DEDUP_KEYS)
+    return {
+        "duplicate": _check_bool(d, "duplicate"),
+        "reasoning": _check_str(d, "reasoning"),
+    }
+
+
+# ---------------------------------------------------------------------------
+# Enforced JSON schemas (T2.6)
+# ---------------------------------------------------------------------------
+# The gpt-5.6 family supports server-side schema enforcement, so the model
+# CANNOT emit a shape that fails validation. That makes most of retry.py's reason
+# for existing go away: `extract_json`'s fence-stripping and brace-slicing
+# fallbacks are workarounds for free-text JSON, and a retry costs a full second
+# call at Sol's output rate.
+#
+# The validate_* functions above are KEPT and still run. Enforcement guarantees
+# the SHAPE; it cannot guarantee the semantics these validators check — that
+# `success_criterion_paired` reads as a paired delta rather than a flat absolute
+# threshold, or that `mechanism_family` is not one this run has already refuted.
+# Those are the checks that actually caught things.
+#
+# Passed as `text={"format": {...}}` on the Responses API (NOT `response_format`,
+# which is the Chat Completions spelling). Verified against OpenAI's
+# structured-outputs guide on 2026-08-31.
+
+def _obj(props: Dict[str, dict], required: List[str]) -> dict:
+    """A strict object schema. `additionalProperties: false` is what makes the
+    enforcement equivalent to `_reject_unknown_keys` above."""
+    return {"type": "object", "properties": props, "required": required,
+            "additionalProperties": False}
+
+
+def _str(desc: str) -> dict:
+    return {"type": "string", "description": desc}
+
+
+DIAGNOSIS_JSON_SCHEMA = {
+    "type": "json_schema", "name": "diagnosis", "strict": True,
+    "schema": _obj({
+        "bottleneck": _str("the single most load-bearing limitation right now"),
+        "evidence": _str("the measured facts that support it"),
+        "confidence": {"type": "number", "minimum": 0, "maximum": 1},
+        "component": _str("which component to change"),
+        "edit_radius": {"type": "string", "enum": ["small", "large"]},
+        "expected_cost": _str("rough implementation cost"),
+        "incompatibilities": {"type": "array", "items": {"type": "string"}},
+        "uncertainty": {"type": "number", "minimum": 0, "maximum": 1},
+    }, _DIAGNOSIS_KEYS),
+}
+
+
+#: The property the hypothesis array is wrapped in. See below for why it exists.
+HYPOTHESES_KEY = "hypotheses"
+
+
+def hypothesis_json_schema(legal_families: List[str] | None = None) -> dict:
+    """Schema for a batch of hypotheses, with the legal families as an enum.
+
+    Built per call rather than as a constant, because the legal set shrinks as
+    families are refuted — and putting it in the enum means the model is
+    structurally unable to propose into a blocked family, rather than being told
+    not to and then rejected for doing it anyway (which it did 3 for 3).
+
+    WHY THE ARRAY IS WRAPPED IN AN OBJECT. Structured outputs requires the ROOT
+    schema to be `type: "object"`; a root array is rejected outright with
+
+        400 invalid_json_schema — schema must be a JSON Schema of
+        'type: "object"', got 'type: "array"'
+
+    so the batch is returned as `{"hypotheses": [...]}`. `validate_hypothesis_list`
+    unwraps it and also still accepts a bare array, because a caller without
+    schema enforcement (a stub, a model that does not support it) legitimately
+    produces one.
+    """
+    families = list(legal_families or LEGAL_DECLARATIONS)
+    if OTHER not in families:
+        families.append(OTHER)
+    item = _obj({
+        "mechanism": _str("the specific causal claim: because X, doing Y "
+                          "should improve Z"),
+        "success_criterion_paired": _str(
+            "a candidate-minus-parent delta claim on a NAMED validation tier, "
+            "phrased so it is falsifiable. Not a flat absolute threshold."),
+        "implementation_sketch": _str("concrete enough to code from — name the "
+                                      "function or lines to change"),
+        "mechanism_family": {"type": "string", "enum": families,
+                             "description": "your own classification of the "
+                                            "mechanism; 'other' if none fit"},
+    }, _HYPOTHESIS_KEYS)
+    return {
+        "type": "json_schema", "name": "hypotheses", "strict": True,
+        "schema": _obj({
+            HYPOTHESES_KEY: {"type": "array", "items": item,
+                             "description": "one object per hypothesis"},
+        }, [HYPOTHESES_KEY]),
+    }
+
+
+VERDICT_JSON_SCHEMA = {
+    "type": "json_schema", "name": "verdict", "strict": True,
+    "schema": _obj({
+        "verdict": {"type": "string", "enum": _VERDICTS},
+        "criterion_was_calibrated": {"type": "boolean"},
+        "reason": _str("why, in one or two sentences"),
+        "next_action": {"type": "string", "enum": _NEXT_ACTIONS},
+    }, _VERDICT_KEYS),
+}
