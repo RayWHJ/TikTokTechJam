@@ -1,0 +1,62 @@
+Loaded 30 nodes, 11 iter records, 0 LLM calls
+
+========================================================================
+
+=== SUMMARY TABLE ROWS (paste into deliverable 3) ===
+
+| Iter | Parent | Hypothesis | Component | GAUC / nDCG@5 / primary | delta paired | p_pos / lower_95 | Status | Notes |
+|------|--------|-----------|-----------|-------------------------|----------|-------------------|--------|-------|
+| 0 | root |  | - | - / - / 0.5946 | - | - | open |  |
+| 1 | 5b7ba11d | Because GAUC and nDCG@5 depend on within-user ordering rather than independent p... | loss_function | 0.6655 / 0.5249 / 0.5952 | +0.0008 | 0.814 / -0.0006 | closed | not_significant |
+| 2 | 5b7ba11d | Because evaluation depends exclusively on within-user ordering while pointwise l... | loss_function | 0.6650 / 0.5253 / 0.5951 | +0.0014 | 0.962 / +0.0001 | open | confirm=0.5507 |
+| 3 | fcb3faae | Because GAUC measures within-user positive-versus-negative ordering, replacing p... | loss_function | 0.6658 / 0.5257 / 0.5957 | +0.0005 | 0.758 / -0.0005 | closed | not_significant |
+| 3 | fcb3faae | Because each user's candidates form a list and ordinary BPR treats every negativ... | loss_function | 0.6599 / 0.5237 / 0.5918 | -0.0044 | 0.000 / -0.0060 | closed | not_significant |
+| 3 | fcb3faae | Because pure BPR directly targets GAUC but can neglect top-five calibration and ... | loss_function | 0.6632 / 0.5247 / 0.5940 | -0.0020 | 0.008 / -0.0032 | closed | not_significant |
+| 4 | fcb3faae | Because unweighted BPR values every inversion equally and is only indirectly ali... | loss_function | 0.6661 / 0.5253 / 0.5957 | +0.0000 | 0.440 / -0.0010 | closed | not_significant |
+| 4 | fcb3faae | Because GAUC is determined by within-user positive-negative ordering, replacing ... | loss_function | - | - | - | closed | failed_implementation |
+| 4 | fcb3faae | Because pure pairwise training discards all-positive and all-negative users and ... | loss_function | 0.6644 / 0.5248 / 0.5946 | -0.0013 | 0.032 / -0.0025 | closed | not_significant |
+| 5 | fcb3faae | Because GAUC measures positive-negative ordering within each user, replacing poi... | loss_function | 0.6666 / 0.5256 / 0.5961 | +0.0008 | 0.908 / -0.0002 | closed | not_significant |
+| 5 | fcb3faae | Because ordinary BPR weights bottom-of-list inversions as strongly as swaps affe... | loss_function | 0.6491 / 0.5198 / 0.5845 | -0.0136 | 0.000 / -0.0154 | closed | not_significant |
+| 5 | fcb3faae | Because exposed-video long_view labels are noisy and unweighted BPR may sacrific... | loss_function | 0.6658 / 0.5253 / 0.5955 | +0.0002 | 0.708 / -0.0004 | closed | not_significant |
+| 6 | 5b7ba11d | Because GAUC measures same-user positive-negative ordering, replacing independen... | loss_function | 0.6650 / 0.5253 / 0.5951 | +0.0014 | 0.962 / +0.0001 | open | confirm=0.5507 |
+| 6 | 5b7ba11d | Because positive-proportional BPR can let high-activity users dominate even thou... | loss_function | 0.6484 / 0.5200 / 0.5842 | -0.0109 | 0.000 / -0.0128 | closed | not_significant |
+| 6 | 5b7ba11d | Because one-negative BPR provides sparse coverage and treats every inversion ind... | loss_function | 0.6661 / 0.5255 / 0.5958 | +0.0019 | 0.992 / +0.0006 | open | confirm=0.5509 |
+| 7 | bbe18131 | Because GAUC is the positive-negative ordering accuracy within each eligible use... | loss_function | 0.6633 / 0.5247 / 0.5940 | -0.0022 | 0.002 / -0.0032 | closed | not_significant |
+| 7 | bbe18131 | Because ordinary BPR spends equal effort on already-easy negatives far below the... | loss_function | 0.6371 / 0.5151 / 0.5761 | -0.0252 | 0.000 / -0.0272 | closed | not_significant |
+| 7 | bbe18131 | Because the primary metric combines GAUC with a top-five list metric, a sampled ... | loss_function | 0.6546 / 0.5211 / 0.5879 | -0.0102 | 0.000 / -0.0117 | closed | not_significant |
+| 8 | 5b7ba11d | Because unweighted BPR treats bottom-of-list and top-five inversions equally, we... | loss_function | 0.6658 / 0.5253 / 0.5955 | +0.0012 | 0.904 / -0.0002 | closed | not_significant |
+| 8 | 5b7ba11d | Because pure BPR aligns with all-pairs GAUC but can neglect top-five calibration... | loss_function | 0.6652 / 0.5250 / 0.5951 | +0.0009 | 0.836 / -0.0004 | closed | not_significant |
+| 8 | 5b7ba11d | Because sampled within-user positive-negative comparisons directly penalize inve... | loss_function | 0.6650 / 0.5253 / 0.5951 | +0.0014 | 0.948 / -0.0000 | closed | not_significant |
+| 9 | fcb3faae | Because GAUC depends only on score differences within each user, replacing indep... | loss_function | 0.6648 / 0.5249 / 0.5949 | -0.0006 | 0.152 / -0.0017 | closed | not_significant |
+| 9 | fcb3faae | Because uniform BPR values every positive-negative inversion equally while nDCG@... | loss_function | - | - | - | closed | failed_implementation |
+| 9 | fcb3faae | Because a grouped softmax makes every logged candidate compete against the other... | loss_function | 0.6429 / 0.5161 / 0.5795 | -0.0203 | 0.000 / -0.0219 | closed | not_significant |
+| 10 | 21a6e2b5 | Because long_view is a noisy and relatively sparse preference label, combining w... | loss_function | - | - | - | closed | failed_implementation |
+| 10 | 21a6e2b5 | Because nDCG@5 averages users rather than individual impressions, a user-balance... | loss_function | 0.6599 / 0.5233 / 0.5916 | -0.0045 | 0.000 / -0.0059 | closed | not_significant |
+| 10 | 21a6e2b5 | Because GAUC is determined by within-user positive-negative comparisons, replaci... | loss_function | - | - | - | closed | failed_implementation |
+| 11 | bbe18131 | Because GAUC measures within-user positive-negative ordering, replacing pointwis... | loss_function | 0.6655 / 0.5249 / 0.5952 | -0.0011 | 0.030 / -0.0021 | closed | not_significant |
+| 11 | bbe18131 | Because primary gives half its weight to nDCG@5 and uniform BPR treats easy bott... | loss_function | 0.6484 / 0.5194 / 0.5839 | -0.0148 | 0.000 / -0.0165 | closed | not_significant |
+| 11 | bbe18131 | Because pure BPR aligns with pair correctness but discards the pointwise label s... | loss_function | 0.6653 / 0.5251 / 0.5952 | -0.0008 | 0.084 / -0.0018 | closed | not_significant |
+
+=== EVIDENCE DISTRIBUTION (paste into deliverable 3) ===
+
+| Status | Evidence Type | Count | IDs |
+|--------|---------------|-------|-----|
+| closed | not_significant | 22 | f58316ed, 082fa66f, 434bbc08, c59ef2f7, 62f79e6c... |
+| open | - | 4 | 5b7ba11d, fcb3faae, 21a6e2b5, bbe18131 |
+| closed | failed_implementation | 4 | 682e4ebf, a0d98a68, 0b4ccfb5, d49ebb76 |
+
+=== CHAMPION (paste into deliverable 4) ===
+
+No candidates promoted this run. global_best = baseline.
+
+=== LLM TOKENS (paste into deliverable 4) ===
+
+No log at .llm_calls_cache/calls.jsonl. Falling back to progress.counters.tokens
+(hardcoded estimates, understates real usage).
+
+=== WALL-CLOCK (paste into deliverable 4) ===
+
+Elapsed:      5050 s   (1.40 h)
+Iterations:   11 of 50
+Mean / iter:  459 s   (7.7 min)
+

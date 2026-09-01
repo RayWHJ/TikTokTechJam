@@ -1,0 +1,919 @@
+[
+  {
+    "fingerprint": [
+      "pointwise_logloss",
+      "uniform",
+      "cwm_13field",
+      "pure"
+    ],
+    "architecture": "FM",
+    "loss": "pointwise_logloss",
+    "sampler": "uniform",
+    "split": "valid+test",
+    "seed_count": 3,
+    "confidence_interval": [
+      0.593,
+      0.595
+    ],
+    "code_hash": "preseed_cwm13",
+    "evidence_type": "refuted_under_context",
+    "note": "CWM 13-field: primary 0.5940 vs 5-field 0.5950 (noise-level, not better)"
+  },
+  {
+    "fingerprint": [
+      "pointwise_logloss",
+      "uniform",
+      "5field_baseline",
+      "pure_k_sweep"
+    ],
+    "architecture": "FM",
+    "loss": "pointwise_logloss",
+    "sampler": "uniform",
+    "split": "valid+test",
+    "seed_count": 1,
+    "confidence_interval": null,
+    "code_hash": "preseed_capacity",
+    "evidence_type": "refuted_under_context",
+    "note": "k=8/16/32 gave 0.5895/0.5902/0.5887; capacity is not the bottleneck"
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "66e65de761045f70",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pointwise BCE spends capacity on cross-user calibration that cannot affect within-user ordering, replacing it with observed-impression within-user BPR should improve GAUC enough to raise the equal-weighted primary metric; retaining a small BCE component should limit possible nDCG@5 regression from BPR's lack of top-5 emphasis.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901986312866211,
+      0.6001986312866211
+    ],
+    "code_hash": "ef87fd88",
+    "evidence_type": "inconclusive",
+    "note": "Because pointwise BCE spends capacity on cross-user calibration that cannot affect within-user ordering, replacing it with observed-impression within-user BPR should improve GAUC enough to raise the equal-weighted primary metric; retaining a small BCE component should limit possible nDCG@5 regression from BPR's lack of top-5 emphasis."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "b128a180f9e8186d",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC depends exclusively on positive-negative ordering within each user, replacing the FM's independent pointwise log-loss with a same-user BPR loss, -log(sigmoid(score_positive - score_negative)), should strengthen the user-conditional interactions that determine ranking while eliminating gradients from irrelevant between-user score calibration, thereby improving GAUC and the equal-weighted primary metric.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5904857667287191,
+      0.6004857667287191
+    ],
+    "code_hash": "98fedeee",
+    "evidence_type": "invariant",
+    "note": "Because GAUC depends exclusively on positive-negative ordering within each user, replacing the FM's independent pointwise log-loss with a same-user BPR loss, -log(sigmoid(score_positive - score_negative)), should strengthen the user-conditional interactions that determine ranking while eliminating gradients from irrelevant between-user score calibration, thereby improving GAUC and the equal-weighted primary metric."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "a8fc563fc10d5399",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because plain BPR weights every inversion equally while nDCG@5 depends mainly on swaps involving the first five ranks, multiplying within-user pairwise logistic gradients by an approximate delta-nDCG swap weight should preserve AUC-oriented pair learning while concentrating updates on errors that can improve nDCG@5.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5909943532943726,
+      0.6009943532943726
+    ],
+    "code_hash": "494eb44f",
+    "evidence_type": "inconclusive",
+    "note": "Because plain BPR weights every inversion equally while nDCG@5 depends mainly on swaps involving the first five ranks, multiplying within-user pairwise logistic gradients by an approximate delta-nDCG swap weight should preserve AUC-oriented pair learning while concentrating updates on errors that can improve nDCG@5."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "3bd3ae66f971c87e",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because one-negative BPR can waste updates on easy negatives and provides incomplete coverage of each exposed candidate list, an exact within-user listwise softmax loss with a uniform target over that user's positive videos should use all observed negatives simultaneously and produce a larger ranking gain than independent pointwise training.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5904535404841105,
+      0.6004535404841105
+    ],
+    "code_hash": "b145e6ea",
+    "evidence_type": "inconclusive",
+    "note": "Because one-negative BPR can waste updates on easy negatives and provides incomplete coverage of each exposed candidate list, an exact within-user listwise softmax loss with a uniform target over that user's positive videos should use all observed negatives simultaneously and produce a larger ranking gain than independent pointwise training."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "a92b5a8766959d78",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC depends only on positive-versus-negative ordering within each user, replacing pointwise binary log-loss with uniform within-user BPR should remove calibration-only gradients and improve GAUC without changing FM capacity.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5903556497891744,
+      0.6003556497891744
+    ],
+    "code_hash": "bc5b5778",
+    "evidence_type": "inconclusive",
+    "note": "Because GAUC depends only on positive-versus-negative ordering within each user, replacing pointwise binary log-loss with uniform within-user BPR should remove calibration-only gradients and improve GAUC without changing FM capacity."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "ed3a79272d7f792b",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pure BPR aligns with pairwise order but can overfit noisy sampled comparisons and discard useful pointwise prevalence information, a mixed objective combining within-user BPR with a smaller binary-log-loss term should preserve the baseline's stable supervision while adding ranking-aligned gradients, improving the primary metric more reliably than either objective alone.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5896542819341024,
+      0.5996542819341024
+    ],
+    "code_hash": "24736e65",
+    "evidence_type": "inconclusive",
+    "note": "Because pure BPR aligns with pairwise order but can overfit noisy sampled comparisons and discard useful pointwise prevalence information, a mixed objective combining within-user BPR with a smaller binary-log-loss term should preserve the baseline's stable supervision while adding ranking-aligned gradients, improving the primary metric more reliably than either objective alone."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "107ea4430c9282d2",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because uniformly sampled negatives can be too easy, selecting the highest-scoring negative from a tiny same-user pool should concentrate BPR updates on false positives near the top of each user's ranking and therefore improve nDCG@5 more than uniform BPR.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5736237915356954,
+      0.5836237915356954
+    ],
+    "code_hash": "056de08f",
+    "evidence_type": "inconclusive",
+    "note": "Because uniformly sampled negatives can be too easy, selecting the highest-scoring negative from a tiny same-user pool should concentrate BPR updates on false positives near the top of each user's ranking and therefore improve nDCG@5 more than uniform BPR."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "8a7201877d238832",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because one-negative BPR often samples an easy comparison with a weak gradient, a within-user multi-negative sampled-softmax loss should create competition against several displayed negatives and automatically emphasize the highest-scoring mistakes, producing stronger top-of-list improvements relevant to nDCG@5 while remaining aligned with GAUC.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.590818559328715,
+      0.600818559328715
+    ],
+    "code_hash": "33a1b5f2",
+    "evidence_type": "invariant",
+    "note": "Because one-negative BPR often samples an easy comparison with a weak gradient, a within-user multi-negative sampled-softmax loss should create competition against several displayed negatives and automatically emphasize the highest-scoring mistakes, producing stronger top-of-list improvements relevant to nDCG@5 while remaining aligned with GAUC."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "9eac481107d0fb04",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pure BPR discards single-class users and can destabilize useful pointwise supervision, a normalized hybrid of same-user BPR and a small binary-log-loss term should retain direct ranking gradients while regularizing embeddings with every observed row, improving the combined GAUC and nDCG@5 primary more reliably than either loss alone.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901478878657023,
+      0.6001478878657023
+    ],
+    "code_hash": "75829470",
+    "evidence_type": "inconclusive",
+    "note": "Because pure BPR discards single-class users and can destabilize useful pointwise supervision, a normalized hybrid of same-user BPR and a small binary-log-loss term should retain direct ranking gradients while regularizing embeddings with every observed row, improving the combined GAUC and nDCG@5 primary more reliably than either loss alone."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "42343bb346aaaecb",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures within-user positive-versus-negative ordering, replacing independent pointwise log-loss with one-negative same-user BPR should give the FM gradients that directly improve those comparisons while preserving its shared interaction embeddings.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5884262871742248,
+      0.5984262871742249
+    ],
+    "code_hash": "549a40b4",
+    "evidence_type": "inconclusive",
+    "note": "Because GAUC measures within-user positive-versus-negative ordering, replacing independent pointwise log-loss with one-negative same-user BPR should give the FM gradients that directly improve those comparisons while preserving its shared interaction embeddings."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "157a7f7cc1a5dcf6",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures within-user positive-negative ordering while pointwise log loss also spends capacity calibrating absolute probabilities, replacing the FM objective with exposure-aware same-user BPR, with a validation-tuned pointwise-loss mixture as a fallback, should improve the equal-weighted primary metric by producing more correctly ordered candidate pairs without discarding the FM's shared ID interactions.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5895388277371725,
+      0.5995388277371725
+    ],
+    "code_hash": "af10132f",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures within-user positive-negative ordering while pointwise log loss also spends capacity calibrating absolute probabilities, replacing the FM objective with exposure-aware same-user BPR, with a validation-tuned pointwise-loss mixture as a fallback, should improve the equal-weighted primary metric by producing more correctly ordered candidate pairs without discarding the FM's shared ID interactions."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "462f358d8aa6cabc",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pointwise log-loss spends capacity on cross-user probability calibration that cannot affect within-user ranking, replacing it with same-user BPR logistic loss over observed positive-negative impression pairs should improve GAUC and, through better positive-above-negative ordering, the primary metric.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901457420984904,
+      0.6001457420984904
+    ],
+    "code_hash": "2bfd26a1",
+    "evidence_type": "not_significant",
+    "note": "Because pointwise log-loss spends capacity on cross-user probability calibration that cannot affect within-user ranking, replacing it with same-user BPR logistic loss over observed positive-negative impression pairs should improve GAUC and, through better positive-above-negative ordering, the primary metric."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "b2b8adab764116e3",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures within-user positive-negative ordering and user-only score offsets cannot affect ranking, replacing the FM's independent pointwise log-loss with within-user BPR loss on exposed long_view=1 versus long_view=0 rows should direct gradients toward useful user-specific ordering and improve the equal-weighted primary metric without changing model capacity.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901457420984904,
+      0.6001457420984904
+    ],
+    "code_hash": "2e41fa6c",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures within-user positive-negative ordering and user-only score offsets cannot affect ranking, replacing the FM's independent pointwise log-loss with within-user BPR loss on exposed long_view=1 versus long_view=0 rows should direct gradients toward useful user-specific ordering and improve the equal-weighted primary metric without changing model capacity."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "738a41eb98d79557",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because one-negative BPR may converge slowly or repeatedly sample easy negatives, a sampled within-user softmax in which each positive competes against several observed negatives should provide broader negative coverage and stronger gradients, improving both overall pair ordering and the probability that positives enter the top five.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.590818559328715,
+      0.600818559328715
+    ],
+    "code_hash": "4f8201aa",
+    "evidence_type": "inconclusive",
+    "note": "Because one-negative BPR may converge slowly or repeatedly sample easy negatives, a sampled within-user softmax in which each positive competes against several observed negatives should provide broader negative coverage and stronger gradients, improving both overall pair ordering and the probability that positives enter the top five."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "94dc8be977e9652c",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because ordinary BPR weights all inversions equally while half of the primary metric is nDCG@5, weighting sampled positive-negative BPR pairs by an approximate change in nDCG@5 should focus optimization on swaps that move positives into or within the first five positions, producing a larger nDCG@5 gain than unweighted pairwise training.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5905315629641215,
+      0.6005315629641215
+    ],
+    "code_hash": "b2510dfe",
+    "evidence_type": "not_significant",
+    "note": "Because ordinary BPR weights all inversions equally while half of the primary metric is nDCG@5, weighting sampled positive-negative BPR pairs by an approximate change in nDCG@5 should focus optimization on swaps that move positives into or within the first five positions, producing a larger nDCG@5 gain than unweighted pairwise training."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "4f3ceee53e3cd464",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures positive-negative ordering within each user, replacing independent pointwise log-loss with one-negative BPR logistic loss should directly reduce the inversions counted by GAUC while preserving the FM's shared user-video and user-author statistical strength.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5900924754142761,
+      0.6000924754142761
+    ],
+    "code_hash": "ada82807",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures positive-negative ordering within each user, replacing independent pointwise log-loss with one-negative BPR logistic loss should directly reduce the inversions counted by GAUC while preserving the FM's shared user-video and user-author statistical strength."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "d69cb13c695661c1",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures within-user positive-negative ordering, replacing independent pointwise log loss with uniform same-user BPR should remove gradients that do not affect within-user rank and improve GAUC without changing the FM representation.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901986312866211,
+      0.6001986312866211
+    ],
+    "code_hash": "57b39d38",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures within-user positive-negative ordering, replacing independent pointwise log loss with uniform same-user BPR should remove gradients that do not affect within-user rank and improve GAUC without changing the FM representation."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "20adf1bb1c87cc6c",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because nDCG@5 depends on competition among all exposed candidates for a user rather than isolated pairs, a positive-count-weighted within-user softmax loss should jointly push positive videos above each user's candidate set and improve the primary more reliably than position-independent pointwise training.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5900947205225626,
+      0.6000947205225626
+    ],
+    "code_hash": "0f5689b4",
+    "evidence_type": "not_significant",
+    "note": "Because nDCG@5 depends on competition among all exposed candidates for a user rather than isolated pairs, a positive-count-weighted within-user softmax loss should jointly push positive videos above each user's candidate set and improve the primary more reliably than position-independent pointwise training."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "05baa42d96b7b742",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because uniform BPR can spend most updates on already-correct negatives and does not emphasize the top of the list, selecting the highest-scoring negative from a small same-user sample should focus pairwise FM updates on likely top-rank errors and raise nDCG@5 while retaining BPR's GAUC alignment.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5803789448738098,
+      0.5903789448738098
+    ],
+    "code_hash": "250bdcb7",
+    "evidence_type": "not_significant",
+    "note": "Because uniform BPR can spend most updates on already-correct negatives and does not emphasize the top of the list, selecting the highest-scoring negative from a small same-user sample should focus pairwise FM updates on likely top-rank errors and raise nDCG@5 while retaining BPR's GAUC alignment."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "d808a855c9a849d9",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC and nDCG@5 depend on within-user ordering rather than independent probability calibration, replacing pointwise log-loss with BPR over exposed positive-negative pairs from the same user should make the FM correct ranking inversions directly and improve the primary score, principally through higher GAUC.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901986312866211,
+      0.6001986312866211
+    ],
+    "code_hash": "f58316ed",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC and nDCG@5 depend on within-user ordering rather than independent probability calibration, replacing pointwise log-loss with BPR over exposed positive-negative pairs from the same user should make the FM correct ranking inversions directly and improve the primary score, principally through higher GAUC."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "749468d66b943f61",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because evaluation depends exclusively on within-user ordering while pointwise logloss also spends capacity calibrating scores across users, replacing the FM objective with sampled within-user BPR should improve GAUC and the equal-weighted primary by directly increasing each positive video's score relative to an exposed negative for the same user.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901457420984904,
+      0.6001457420984904
+    ],
+    "code_hash": "fcb3faae",
+    "evidence_type": "inconclusive",
+    "note": "Because evaluation depends exclusively on within-user ordering while pointwise logloss also spends capacity calibrating scores across users, replacing the FM objective with sampled within-user BPR should improve GAUC and the equal-weighted primary by directly increasing each positive video's score relative to an exposed negative for the same user."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "eaa9b19a1d1d75e8",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures within-user positive-versus-negative ordering, replacing pointwise binary cross-entropy with uniformly sampled same-user BPR should improve GAUC enough to raise primary without changing the FM scoring function.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.590735232035319,
+      0.600735232035319
+    ],
+    "code_hash": "082fa66f",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures within-user positive-versus-negative ordering, replacing pointwise binary cross-entropy with uniformly sampled same-user BPR should improve GAUC enough to raise primary without changing the FM scoring function."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "e8398ae11bb57bf3",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pure BPR directly targets GAUC but can neglect top-five calibration and users that cannot form mixed-label pairs, alternating BPR updates with the existing pointwise loss should preserve nDCG@5 while adding within-user ranking pressure, producing a larger primary gain than either objective alone.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5889726630846659,
+      0.5989726630846659
+    ],
+    "code_hash": "c59ef2f7",
+    "evidence_type": "not_significant",
+    "note": "Because pure BPR directly targets GAUC but can neglect top-five calibration and users that cannot form mixed-label pairs, alternating BPR updates with the existing pointwise loss should preserve nDCG@5 while adding within-user ranking pressure, producing a larger primary gain than either objective alone."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "80d7dca7982e6d56",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because each user's candidates form a list and ordinary BPR treats every negative independently, a segmented within-user softmax loss with probability mass distributed uniformly over that user's positive rows should make positives compete jointly against all exposed negatives and improve both overall ordering and concentration of positives near the top five.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5867930006980896,
+      0.5967930006980896
+    ],
+    "code_hash": "434bbc08",
+    "evidence_type": "not_significant",
+    "note": "Because each user's candidates form a list and ordinary BPR treats every negative independently, a segmented within-user softmax loss with probability mass distributed uniformly over that user's positive rows should make positives compete jointly against all exposed negatives and improve both overall ordering and concentration of positives near the top five."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "c1f43601afcf202a",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because unweighted BPR values every inversion equally and is only indirectly aligned with nDCG@5, a sampled within-user listwise softmax objective over one positive and several exposed negatives should concentrate gradient on high-scoring competing negatives, improving top-5 ordering and nDCG@5 without requiring full-list sorting.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5906969261169434,
+      0.6006969261169434
+    ],
+    "code_hash": "62f79e6c",
+    "evidence_type": "not_significant",
+    "note": "Because unweighted BPR values every inversion equally and is only indirectly aligned with nDCG@5, a sampled within-user listwise softmax objective over one positive and several exposed negatives should concentrate gradient on high-scoring competing negatives, improving top-5 ordering and nDCG@5 without requiring full-list sorting."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "31992336cab6e78e",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pure pairwise training discards all-positive and all-negative users and can provide unstable shared video and author estimates, a mixed objective combining within-user BPR with a smaller pointwise log-loss term should preserve global parameter calibration while making the dominant gradient ranking-aligned, improving primary more reliably than either objective alone.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5895596297581991,
+      0.5995596297581991
+    ],
+    "code_hash": "ba3bdb75",
+    "evidence_type": "not_significant",
+    "note": "Because pure pairwise training discards all-positive and all-negative users and can provide unstable shared video and author estimates, a mixed objective combining within-user BPR with a smaller pointwise log-loss term should preserve global parameter calibration while making the dominant gradient ranking-aligned, improving primary more reliably than either objective alone."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "78e558bf95b96840",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures positive-negative ordering within each user, replacing pointwise binary cross-entropy with uniformly sampled within-user BPR should direct every useful gradient toward the evaluated ordering and improve GAUC without spending capacity on user-constant calibration.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5910967342058817,
+      0.6010967342058817
+    ],
+    "code_hash": "3769a939",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures positive-negative ordering within each user, replacing pointwise binary cross-entropy with uniformly sampled within-user BPR should direct every useful gradient toward the evaluated ordering and improve GAUC without spending capacity on user-constant calibration."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "768916c8641d5c43",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because exposed-video long_view labels are noisy and unweighted BPR may sacrifice top-five quality, a mixed objective dominated by within-user BPR but regularized by a small pointwise logloss term should preserve the parent FM's calibration and nDCG@5 while adding ranking-aligned gradients that improve GAUC.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5905470403035482,
+      0.6005470403035482
+    ],
+    "code_hash": "758f527f",
+    "evidence_type": "not_significant",
+    "note": "Because exposed-video long_view labels are noisy and unweighted BPR may sacrifice top-five quality, a mixed objective dominated by within-user BPR but regularized by a small pointwise logloss term should preserve the parent FM's calibration and nDCG@5 while adding ranking-aligned gradients that improve GAUC."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "a1ca3ddcab22e5f6",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because ordinary BPR weights bottom-of-list inversions as strongly as swaps affecting the first five positions, weighting sampled within-user positive-negative pairs by their approximate change in nDCG@5 and emphasizing currently high-scoring negatives should concentrate learning on errors that affect the primary metric's top-five component.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5794616889953613,
+      0.5894616889953613
+    ],
+    "code_hash": "74b64c5c",
+    "evidence_type": "not_significant",
+    "note": "Because ordinary BPR weights bottom-of-list inversions as strongly as swaps affecting the first five positions, weighting sampled within-user positive-negative pairs by their approximate change in nDCG@5 and emphasizing currently high-scoring negatives should concentrate learning on errors that affect the primary metric's top-five component."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "9c284ce281736ec4",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because one-negative BPR provides sparse coverage and treats every inversion independently, a small multi-negative within-user sampled-softmax loss should compare each positive against several exposed negatives simultaneously, yielding a stronger approximation to listwise competition and improving nDCG@5 without full-list rank computation.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.590818559328715,
+      0.600818559328715
+    ],
+    "code_hash": "bbe18131",
+    "evidence_type": "inconclusive",
+    "note": "Because one-negative BPR provides sparse coverage and treats every inversion independently, a small multi-negative within-user sampled-softmax loss should compare each positive against several exposed negatives simultaneously, yielding a stronger approximation to listwise competition and improving nDCG@5 without full-list rank computation."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "5f134e3d42e33692",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures same-user positive-negative ordering, replacing independent pointwise log-loss with same-user pairwise logistic BPR loss should directly reduce the inversions counted by GAUC; user-constant terms cancel from score differences while user-video and user-context interactions receive ranking-aligned gradients.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901457420984904,
+      0.6001457420984904
+    ],
+    "code_hash": "21a6e2b5",
+    "evidence_type": "inconclusive",
+    "note": "Because GAUC measures same-user positive-negative ordering, replacing independent pointwise log-loss with same-user pairwise logistic BPR loss should directly reduce the inversions counted by GAUC; user-constant terms cancel from score differences while user-video and user-context interactions receive ranking-aligned gradients."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "0e7ed62541d2a4c9",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because positive-proportional BPR can let high-activity users dominate even though nDCG@5 averages users equally, uniformly sampling mixed-label users and capping the number of pairs contributed by each user should preserve ranking-aligned learning while improving top-five quality for the typical user.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5791678380966186,
+      0.5891678380966187
+    ],
+    "code_hash": "823c887c",
+    "evidence_type": "not_significant",
+    "note": "Because positive-proportional BPR can let high-activity users dominate even though nDCG@5 averages users equally, uniformly sampling mixed-label users and capping the number of pairs contributed by each user should preserve ranking-aligned learning while improving top-five quality for the typical user."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "c028924d16c8c717",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC is the positive-negative ordering accuracy within each eligible user, replacing most of the FM's independent pointwise loss with within-user BPR should directly reduce ranking inversions; retaining a small pointwise term should stabilize training and prevent severe score drift.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5889646164576212,
+      0.5989646164576212
+    ],
+    "code_hash": "0a85759f",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC is the positive-negative ordering accuracy within each eligible user, replacing most of the FM's independent pointwise loss with within-user BPR should directly reduce ranking inversions; retaining a small pointwise term should stabilize training and prevent severe score drift."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "c10688a78e1336b2",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because the primary metric combines GAUC with a top-five list metric, a sampled within-user listwise objective that assigns probability mass jointly to all positives in a small candidate slate should better model competition near the top of each user's ranking than independent log-loss or uniformly weighted pairs.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5828535707791647,
+      0.5928535707791647
+    ],
+    "code_hash": "c33137d7",
+    "evidence_type": "not_significant",
+    "note": "Because the primary metric combines GAUC with a top-five list metric, a sampled within-user listwise objective that assigns probability mass jointly to all positives in a small candidate slate should better model competition near the top of each user's ranking than independent log-loss or uniformly weighted pairs."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "c8d2ab237e25b7ad",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because ordinary BPR spends equal effort on already-easy negatives far below the top five, selecting a moderately hard displayed negative from a small within-user sample should concentrate FM updates on inversions most likely to affect nDCG@5 while still improving positive-negative ordering for GAUC.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.571074481010437,
+      0.581074481010437
+    ],
+    "code_hash": "361ff303",
+    "evidence_type": "not_significant",
+    "note": "Because ordinary BPR spends equal effort on already-easy negatives far below the top five, selecting a moderately hard displayed negative from a small within-user sample should concentrate FM updates on inversions most likely to affect nDCG@5 while still improving positive-negative ordering for GAUC."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "a9981dfddcb47d28",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because sampled within-user positive-negative comparisons directly penalize inversions and weight users approximately by their positive-row counts, replacing pointwise logloss with one-negative-per-positive BPR should improve GAUC without changing the FM scorer.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901457420984904,
+      0.6001457420984904
+    ],
+    "code_hash": "d5b2de21",
+    "evidence_type": "not_significant",
+    "note": "Because sampled within-user positive-negative comparisons directly penalize inversions and weight users approximately by their positive-row counts, replacing pointwise logloss with one-negative-per-positive BPR should improve GAUC without changing the FM scorer."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "dd72e54eb9cc116b",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because unweighted BPR treats bottom-of-list and top-five inversions equally, weighting sampled positive-negative pairs by a clipped approximation to their current nDCG@5 swap impact should concentrate FM updates on errors capable of changing the top-five ranking and therefore improve nDCG@5 while retaining pairwise GAUC alignment.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5905287218093872,
+      0.6005287218093872
+    ],
+    "code_hash": "b2d8045e",
+    "evidence_type": "not_significant",
+    "note": "Because unweighted BPR treats bottom-of-list and top-five inversions equally, weighting sampled positive-negative pairs by a clipped approximation to their current nDCG@5 swap impact should concentrate FM updates on errors capable of changing the top-five ranking and therefore improve nDCG@5 while retaining pairwise GAUC alignment."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "5ea27ed5c80e2080",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pure BPR aligns with all-pairs GAUC but can neglect top-five calibration and amplify noisy binary preferences, a convex mixture of BPR and pointwise logloss should preserve the parent's nDCG@5 signal while adding within-user inversion gradients, improving the equal-weighted primary more reliably than either objective alone.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901048731803894,
+      0.6001048731803894
+    ],
+    "code_hash": "bc27f670",
+    "evidence_type": "not_significant",
+    "note": "Because pure BPR aligns with all-pairs GAUC but can neglect top-five calibration and amplify noisy binary preferences, a convex mixture of BPR and pointwise logloss should preserve the parent's nDCG@5 signal while adding within-user inversion gradients, improving the equal-weighted primary more reliably than either objective alone."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "37e51a38047dcb5d",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC depends only on score differences within each user, replacing independent long_view log-loss with uniform same-user BPR should direct FM updates toward observed positive-over-negative ordering and improve GAUC without requiring additional model capacity.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5898543945948282,
+      0.5998543945948283
+    ],
+    "code_hash": "05a47942",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC depends only on score differences within each user, replacing independent long_view log-loss with uniform same-user BPR should direct FM updates toward observed positive-over-negative ordering and improve GAUC without requiring additional model capacity."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "e022cbf9d33f48fd",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because a grouped softmax makes every logged candidate compete against the other candidates of the same user, optimizing the probability mass assigned to that user's long_view positives should emphasize relative list quality more directly than either globally calibrated pointwise probabilities or uniformly sampled pair comparisons, improving nDCG@5 and primary.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5744878602027893,
+      0.5844878602027893
+    ],
+    "code_hash": "f2a5c758",
+    "evidence_type": "not_significant",
+    "note": "Because a grouped softmax makes every logged candidate compete against the other candidates of the same user, optimizing the probability mass assigned to that user's long_view positives should emphasize relative list quality more directly than either globally calibrated pointwise probabilities or uniformly sampled pair comparisons, improving nDCG@5 and primary."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "25acd3c3b539bdfd",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because nDCG@5 averages users rather than individual impressions, a user-balanced grouped-softmax FM loss should prevent high-activity users from dominating training and concentrate each mixed-label user's probability mass on its long_view positives, improving top-five ranking while preserving pairwise separation.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5866078488032023,
+      0.5966078488032023
+    ],
+    "code_hash": "b14fe530",
+    "evidence_type": "not_significant",
+    "note": "Because nDCG@5 averages users rather than individual impressions, a user-balanced grouped-softmax FM loss should prevent high-activity users from dominating training and concentrate each mixed-label user's probability mass on its long_view positives, improving top-five ranking while preserving pairwise separation."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "cb6ddf5f41621e70",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because pure BPR aligns with pair correctness but discards the pointwise label signal that may help place positives near the top, a mixed objective dominated by within-user BPR with a smaller pointwise log-loss term should raise GAUC while preserving or improving nDCG@5.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901657096544901,
+      0.6001657096544901
+    ],
+    "code_hash": "7c31494c",
+    "evidence_type": "not_significant",
+    "note": "Because pure BPR aligns with pair correctness but discards the pointwise label signal that may help place positives near the top, a mixed objective dominated by within-user BPR with a smaller pointwise log-loss term should raise GAUC while preserving or improving nDCG@5."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "688109c0c41c7adb",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because GAUC measures within-user positive-negative ordering, replacing pointwise log-loss with fixed-cost within-user BPR should improve GAUC and primary by applying gradients directly to FM score differences between long_view=1 and long_view=0 impressions.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.5901986312866211,
+      0.6001986312866211
+    ],
+    "code_hash": "613f8545",
+    "evidence_type": "not_significant",
+    "note": "Because GAUC measures within-user positive-negative ordering, replacing pointwise log-loss with fixed-cost within-user BPR should improve GAUC and primary by applying gradients directly to FM score differences between long_view=1 and long_view=0 impressions."
+  },
+  {
+    "fingerprint": [
+      "mechanism_hash",
+      "e37f44c40ea89462",
+      "",
+      ""
+    ],
+    "architecture": "FM",
+    "loss": "Because primary gives half its weight to nDCG@5 and uniform BPR treats easy bottom-ranked negatives like top-ranked negatives, choosing the highest-scoring negative from a small fixed within-user sample should concentrate pairwise gradients on candidates that threaten the top five and improve nDCG@5 without the cost of full LambdaRank sorting.",
+    "sampler": "uniform",
+    "split": "valid_search",
+    "seed_count": 2,
+    "confidence_interval": [
+      0.57892862478892,
+      0.58892862478892
+    ],
+    "code_hash": "76848f7f",
+    "evidence_type": "not_significant",
+    "note": "Because primary gives half its weight to nDCG@5 and uniform BPR treats easy bottom-ranked negatives like top-ranked negatives, choosing the highest-scoring negative from a small fixed within-user sample should concentrate pairwise gradients on candidates that threaten the top five and improve nDCG@5 without the cost of full LambdaRank sorting."
+  }
+]
