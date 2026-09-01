@@ -1,207 +1,322 @@
-# KuaiRand-Pure Starter Kit
+# Autonomous ML Research Agent for Recommender Systems
 
-## 依赖
+## Project Overview
 
-Python 3.9+ 和 numpy。**没有别的。** 不需要 torch、pandas、sklearn。
+This project is an autonomous machine learning research agent for recommender systems. It automates the full experiment loop:
 
-## 数据
+1. Inspect the current pipeline and results.
+2. Propose a focused improvement.
+3. Generate a new implementation.
+4. Run the candidate in a controlled environment.
+5. Evaluate GAUC and nDCG@5.
+6. Reflect on the result and select the next action.
+7. Keep the best valid checkpoint.
 
-从 https://kuairand.com 下载（Zenodo 直链，无需注册）：
+The required benchmark is KuaiRand-Pure. The task predicts the `long_view` label and ranks videos within each user's logged impressions.
+
+The active search strategy follows an AIDE-style code refinement loop. It is supported by additional controls for experiment selection, measurement, failure recovery, convergence, and logging.
+
+## System Components
+
+| Component | Responsibility |
+|---|---|
+| Harness | Runs candidates, applies limits, validates outputs, collects metrics, and records failures. |
+| Codegen | Converts experiment hypotheses into focused code changes. |
+| LLM calls | Manages model requests, structured responses, retries, and token accounting. |
+| Orchestrator | Controls the research loop, candidate selection, recovery, convergence, and final checkpoint selection. |
+
+These components are separated so that model reasoning, code generation, execution, and evaluation can be tested independently.
+
+## Evaluation Target
+
+| Item | Configuration |
+|---|---|
+| Required dataset | KuaiRand-Pure |
+| Relevance label | `long_view` |
+| Ranking scope | Each user's logged impressions |
+| Metrics | GAUC and nDCG@5 |
+| Primary score | Mean of GAUC and nDCG@5 |
+| Baseline | Organizer-provided factorization machine |
+| Convergence | No improvement greater than 0.002 for three consecutive iterations |
+| Maximum run | 50 iterations or six hours |
+
+KuaiRand-1k and KuaiRand-27k are optional bonus benchmarks.
+
+## Setup and Installation
+
+### Requirements
+
+- Python 3.10 or later
+- Git
+- KuaiRand-Pure data
+- Access to the configured LLM provider
+- A valid API key for the selected model
+
+A GPU is not required for the provided baseline.
+
+### Clone the Repository
 
 ```bash
-# 在 Starter Kit 目录下执行，解压后得到 ./KuaiRand-Pure/
-wget https://zenodo.org/records/10439422/files/KuaiRand-Pure.tar.gz
-tar xzf KuaiRand-Pure.tar.gz
+git clone <repository-url>
+cd <repository-directory>
 ```
 
-## 运行
+### Create a Virtual Environment
+
+Linux or macOS:
 
 ```bash
-python3 baseline.py --model fm
+python3 -m venv .venv
+source .venv/bin/activate
 ```
 
-`--data_dir` 默认 `./KuaiRand-Pure/data`；数据放在别处时显式指定。
+Windows:
 
-`--model` 可选 `fm`（官方 baseline）/ `pop`（trivial baseline）/ `random`（下界，用于自检评测代码）。
-FM 全程约 40 秒（CPU，单核）。
-
-## 任务定义（口径已写死，不要改）
-
-| | |
-|---|---|
-| 任务 | **用户内排序** —— 每个用户只对其在评测集中的曝光排序，不做全库检索 |
-| 相关性标签 | `long_view`（原生列，0/1） |
-| 指标 | `GAUC`、`nDCG@5`；**主分 = 两者平均** |
-| 数据划分 | train `20220408–20220421` / valid `20220422–20220428` / test `20220429–20220508` |
-| 零正例用户 | nDCG 记 0.0 并计入平均；GAUC 只统计 `0 < 正例数 < 曝光数` 的用户，按正例数加权 |
-| nDCG gain | `2^rel − 1`（二元标签下等价于 identity） |
-
-实现见 `evaluate.py`，全部约定写在文件头注释里。
-
-## Baseline 阶梯
-
-test 集上的分数。**要打败的是 FM 这一行。**
-
-| | GAUC | nDCG@5 | primary |
-|---|---|---|---|
-| random（下界，自检用） | 0.4996 | 0.4511 | 0.4753 |
-| item popularity（trivial） | 0.6308 | 0.5121 | 0.5715 |
-| LightGBM lambdarank（本仓库加的，见下） | 0.6356 | 0.5154 | 0.5755 |
-| **FM（官方 baseline）** | **0.6610** | **0.5282** | **0.5946** |
-
-### 本仓库追加：`--model lgb`（LightGBM，实测**打不过** FM）
-
-`python3 baseline.py --model lgb`。特征全部是 **train-only** 的聚合量
-（video / author / user 的平滑 long_view 率、曝光计数、duration、tab，
-以及一个 video × 用户活跃度十分位 的粗粒度交叉），实现见 `data.py:encode_lgb`。
-早停用的是**官方 primary**（`_primary_feval`），不是 LightGBM 自带的 ndcg
-—— 后者跳过全负用户，同一份预测下自带 ndcg@5 报 0.8287 而官方口径是 0.5255。
-
-实测（test primary）：
-
-| 配置 | primary |
-|---|---|
-| lambdarank | 0.5755 |
-| lambdarank，降容量 | 0.5795 |
-| binary objective | 0.5800 |
-| binary + 3-fold OOF FM 分数做特征 | 0.5797 |
-| **FM（参照）** | **0.5953** |
-
-**为什么打不过，两条都是结构性的、不是调参问题：**
-
-1. **协同信号拿不到。** train 里 `user × author` 平均只出现 **1.07** 次
-   （1,070,326 对 / 1,141,112 行），`user × video` 更稀疏。所以任何 per-pair
-   target encoding 都只是一次观测的噪声，平滑之后退回 author 率。FM 的
-   embedding 靠 SGD 在用户之间共享统计强度，计数特征做不到 —— 这正是 FM
-   的 0.5946 高于纯 item popularity 的 0.5715 的原因。
-2. **pointwise GBDT 把容量花在了指标忽略的方差上。** 在 stack 模型里增益最大
-   的特征是 `user_rate`（944k，是 fm_score 的两倍），而它**在用户内是常数**，
-   按定义不可能改变用户内排序。目标函数奖励"预测该用户的基础率"，而指标只看
-   用户内顺序。
-
-这条路留在仓库里作为**已测负结果**（也写进了 `orchestrator/_state` 的 memory
-preseed 和 `llm_calls/personas.py` 的上下文），agent 不必再花迭代重新发现。
-
-### ⚠️ 指标的真实区间：nDCG@5 的天花板是 0.729，不是 1.0
-
-test 集 23,875 个用户里：
-
-| | 占比 | 对指标的影响 |
-|---|---|---|
-| 全负用户（该用户所有曝光都不是 long_view） | **27.1%** | nDCG 恒为 **0**，任何模型都救不了；不计入 GAUC |
-| 全正用户 | **9.2%** | nDCG 恒为 **1**；不计入 GAUC |
-| 有区分度的用户 | **63.7%** | GAUC 的实际样本 |
-
-所以用真实标签当预测分（oracle，完美排序）也只能拿到：
-
-| | random | FM baseline | **oracle 上限** | FM 已吃掉的区间 |
-|---|---|---|---|---|
-| GAUC | 0.4996 | 0.6610 | **1.0000** | 32.3% |
-| nDCG@5 | 0.4511 | 0.5282 | **0.7289** | 27.8% |
-| **primary** | 0.4753 | **0.5946** | **0.8645** | **30.7%** |
-
-**评估进展请以 oracle 为分母。** 看到 0.5946 就以为「离满分 1.0 还很远」是误判——
-baseline 已经吃掉可用区间的三成，剩余 headroom 是 0.27 而不是 0.41。
-
-FM 在 5 个随机种子上的 std 均为 **0.0008**。据此收敛判据取 **ε = 0.002（≈2.5σ）, N = 3**：
-连续 3 轮迭代 validation 主分提升不超过 0.002 即判定收敛。
-
-> 自检：如果你的评测代码跑 `--model random` 得不到 primary ≈ 0.475（±0.001），说明 harness 有问题，先修它。
-
-## 提交格式
-
-CSV，含表头，一行对应评测集的一行：
-
-```
-row_id,user_id,video_id,score
-0,0,7531,-3.34176
-1,0,4214,-1.4955
-...
+```powershell
+python -m venv .venv
+.venv\Scripts\activate
 ```
 
-| 字段 | 说明 |
-|---|---|
-| `row_id` | 0 起连续递增，对应 `data.load()[split]` 的行序（确定性：先读 `log_standard_4_08_to_4_21_pure.csv` 再读 `log_standard_4_22_to_5_08_pure.csv`，按 date 过滤后保持原文件顺序） |
-| `user_id` / `video_id` | 冗余字段，仅用于校验对齐 |
-| `score` | 你的模型给该行打的分，任意实数，只用相对大小；不允许 NaN / Inf |
-
-> **为什么必须带 `row_id`：** `(user_id, video_id)` 在评测集里**不唯一** ——
-> test 集有 3.06% 的重复对，最多重复 12 次。所以它不能作为主键。
-
-生成与校验：
+### Install Dependencies
 
 ```bash
-python3 submit.py --make  --split test  submission.csv    # 用官方 FM baseline 生成一份示例提交
-python3 submit.py --check --split test  submission.csv    # 校验格式与对齐
-python3 submit.py --score --split valid submission.csv    # 校验并打分（本地 valid 可用）
+python -m pip install --upgrade pip
+python -m pip install -r requirements-dev.txt
 ```
 
-`--check` 会拒绝：表头错误、行数不符、`row_id` 跳号、`user_id`/`video_id` 与评测集不对齐、
-`score` 非数字或为 NaN/Inf。**提交前请自行跑一遍 `--check`。**
+### Configure the Dataset
 
-## 从哪里开始改
+Download the two KuaiRand-Pure interaction files and keep their original names:
 
-下面的排序是**实测过的**，不是猜的。组委会已经试过的死路直接标出来，别重复踩。
-
-### 已实测：这两条没有收益，不要浪费迭代
-
-| 试过的 | 结果 |
-|---|---|
-| **加静态特征** —— 把 CWM 的 13 个特征域全接进来（+`music_id`/`video_type`/`upload_type` + 6 个用户侧粗桶） | primary **0.5940** vs 5 域的 **0.5950**，噪声内无差别，甚至略降 |
-| **加模型容量** —— embedding 维度 k = 8 / 16 / 32 | 0.5895 / 0.5902 / 0.5887，几乎不动 |
-
-原因：`user_id × video_id` 的交叉已经吃掉了大部分可学的信号。`follow_user_num_range` 这类粗桶
-在 `user_id` 面前是冗余的；而 114 万行数据也撑不起更大的容量。**瓶颈不在特征和容量。**
-
-⚠️ 另外注意：**纯用户侧特征的一阶项对分数贡献恒为 0。** 因为排序在用户内部做，任何在用户内为常数的项
-都不改变组内顺序（实测：`item_pop × 用户偏置` 和纯 `item_pop` 的分数一位不差）。用户侧特征只能通过
-**与物品侧的交叉项**起作用。
-
-### 未探索：headroom 应该在这里
-
-按我们判断的可能性排序（**这几条组委会没测过，是留给你们的**）：
-
-1. **换损失函数。** 现在是 pointwise logloss，但指标（GAUC / nDCG）是**排序指标**。
-   换成 pairwise（BPR）或 listwise（对该用户的曝光做 softmax）—— 目标函数和评测口径对齐，
-   这是我们认为最可能有效的一条。
-2. **用户历史序列。** 现有特征**完全没用到行为序列**。KuaiRand 每用户在 train 里有上百到上千条交互，
-   DIN / SIM 那一类的兴趣建模是完全空白的方向。
-3. **多目标。** 日志里还有 `is_click`、`is_like`、`is_follow`、`is_comment`、`is_forward`、`play_time_ms`，
-   可以做多任务辅助 `long_view` 主任务。
-4. **观看时长的建模。** [CWM](https://github.com/hyz20/CWM) 的贡献正是这条：它把观看时长做**删失回归**
-   （视频播完时真实观看时长被截断，所以用单侧损失而非平方误差）。这是个有研究深度的方向。
-5. **换模型。** DeepFM / DCN / xDeepFM。鉴于容量实测不是瓶颈，**优先级放在 1-4 之后**。
-6. **时间特征与分布漂移。** `hourmin`、`date`，以及 train 与 test 之间的漂移。
-7. **无偏验证（进阶）。** `log_random_4_22_to_5_08_pure.csv` 是随机曝光日志（118 万行），
-   可作为额外的无偏验证集，检查模型是否只在有偏流量上过拟合。
-
-## 用你自己的模型（包括 CWM）
-
-`evaluate.py` 与模型完全解耦，它只要三个等长数组：
-
-```python
-from evaluate import evaluate
-print(evaluate(user_ids, labels, scores))   # scores 可以来自任何模型
+```text
+log_standard_4_08_to_4_21_pure.csv
+log_standard_4_22_to_5_08_pure.csv
 ```
 
-- `user_ids`：评测集每一行的 user_id
-- `labels`：该行的 `long_view`（0/1）
-- `scores`：你的模型给该行打的分（任意实数，只用相对大小）
+Place them in the dataset location expected by `data.py`.
 
-所以你可以完全不用 `baseline.py`，换成 PyTorch、LightGBM 或 [CWM](https://github.com/hyz20/CWM) 的 xDeepFM，
-只要最后把 `scores` 交给 `evaluate()` 即可。**评分口径由 `evaluate.py` 唯一决定。**
+The fixed date split is:
 
-> 用 CWM 需注意：它依赖 `torch==1.6.0`（2020 年版本，新 GPU 上大概装不上），
-> 且它的损失优化的是 counterfactual watch time、评测标签是自己重建的 `long_view2`。
-> 它是一篇时长纠偏论文的研究代码，可以当**进阶参考**，不建议作为起步点。
+- Training: 8 April 2022 to 21 April 2022
+- Validation: 22 April 2022 to 28 April 2022
+- Evaluation: 29 April 2022 to 8 May 2022
 
-## 文件
+Do not change the split or use the evaluation data during development.
 
-| | |
+### Configure the LLM
+
+Export the API key and model configuration required by the LLM-call module before starting a run.
+
+Do not commit API keys, tokens, `.env` files, generated credentials, or private model responses.
+
+## Verify the Installation
+
+Run the automated tests:
+
+```bash
+pytest -q
+```
+
+Reproduce the official baseline:
+
+```bash
+python baseline.py --model fm
+```
+
+The baseline run should complete successfully and produce GAUC, nDCG@5, and the combined primary score.
+
+## Steps to Reproduce the Result
+
+### 1. Validate the Baseline
+
+```bash
+python baseline.py --model fm
+```
+
+Confirm that the baseline result is consistent with `baseline_scores.json`.
+
+### 2. Run the Test Suite
+
+```bash
+pytest -q
+```
+
+All harness, evaluation, code generation, LLM-call, and orchestration tests should pass before an autonomous run begins.
+
+### 3. Start the Autonomous Research Agent
+
+```bash
+python -m orchestrator.driver
+```
+
+The orchestrator will:
+
+1. Load the baseline and current candidate.
+2. Inspect the experiment history.
+3. Choose a focused hypothesis.
+4. Request a code change.
+5. Validate and execute the candidate.
+6. Calculate GAUC, nDCG@5, and the primary score.
+7. Record the code diff and outcome.
+8. Recover from invalid or failed implementations.
+9. Select the next parent candidate.
+10. Stop when the convergence or budget rule is reached.
+
+### 4. Review the Run Logs
+
+Each iteration should contain:
+
+- Iteration number
+- Parent candidate
+- Experiment hypothesis
+- Reason for the experiment
+- Generated code diff
+- GAUC
+- nDCG@5
+- Primary score
+- Runtime
+- Token usage
+- Candidate status
+- Error and recovery events
+- Manual interventions
+
+Use the final run summary as the authoritative record of the reproduced result.
+
+### 5. Validate the Final Submission
+
+Generate or select the final prediction file, then validate it:
+
+```bash
+python submit.py --check <submission-file.csv>
+```
+
+The validator checks:
+
+- Header order
+- Row count
+- Continuous `row_id` values
+- Evaluation-row alignment
+- Numeric scores
+- Missing or invalid values
+
+Only a validated file should be submitted.
+
+### 6. Confirm the Final Checkpoint
+
+The final checkpoint must be the validation-best candidate available when the run converges. It must not be selected using hidden evaluation results.
+
+Record the following values in the final results summary:
+
+| Metric | Result |
+|---|---:|
+| GAUC | Generated by the final run |
+| nDCG@5 | Generated by the final run |
+| Primary score | Mean of GAUC and nDCG@5 |
+| Delta over baseline | Final score minus official baseline |
+| Iterations | Generated by the final run |
+| Manual interventions | Generated by the final run |
+| Agent wall-clock | Generated by the final run |
+| LLM tokens | Generated by the final run |
+
+## Experiment Integrity
+
+The project applies the following rules:
+
+- Training and model selection use only the training and validation splits.
+- The evaluation split is never exposed to the research agent.
+- Every candidate uses the same evaluation implementation.
+- Invalid candidates cannot replace a valid parent.
+- Failed experiments remain visible in the run history.
+- Metric comparisons use the same data, seeds, and scoring rules.
+- The final checkpoint is selected by validation performance.
+- Human interventions are counted and reported.
+
+## Solution Limitations
+
+### Limited Search Budget
+
+The current submission explores only a small part of the possible feature, model, and training space. A better method may remain undiscovered when the run converges early.
+
+### Dependence on LLM Quality
+
+Experiment quality depends on the selected model and prompt. The LLM may propose weak hypotheses, repeat earlier ideas, or generate invalid code.
+
+### Non-Deterministic Generation
+
+The same run may produce different hypotheses and implementations because model responses are not fully deterministic.
+
+### Failure Cost
+
+Invalid candidates still consume time and tokens. Recovery prevents the run from stopping, but it cannot remove the cost of failed attempts.
+
+### Single Required Benchmark
+
+The main development effort focuses on KuaiRand-Pure. Performance on larger KuaiRand variants has not been established.
+
+### Limited Statistical Evidence
+
+A small number of full runs is not enough to measure the variance of the complete autonomous process. Reported results should be interpreted as a demonstrated run, not a guaranteed outcome.
+
+### Local Optimization Risk
+
+The agent may overfit to public validation feedback even when it never accesses the hidden evaluation set.
+
+### Search Strategy
+
+The active runtime uses an AIDE-style refinement loop. More direct ablation-guided experiment selection is not fully active in the submitted run.
+
+## Potential Improvements
+
+### Stronger Experiment Selection
+
+Add ablation-guided selection to identify which pipeline component has the highest improvement potential before generating code.
+
+### Better Search Memory
+
+Store structured information about successful, failed, and redundant ideas. Use this memory to improve candidate diversity and avoid repeated experiments.
+
+### Repeated Runs
+
+Run the full process across multiple seeds and LLM sampling settings. Report the mean, variance, and success rate.
+
+### Cost-Aware Routing
+
+Use smaller models for simple analysis and reserve stronger models for difficult reasoning or code repair.
+
+### Safer Code Generation
+
+Add static analysis, dependency checks, and more targeted patch constraints before candidate execution.
+
+### Better Parent Selection
+
+Improve tree search using uncertainty, novelty, expected gain, and implementation risk instead of relying mainly on the current best candidate.
+
+### Larger Benchmarks
+
+Evaluate the same agent on KuaiRand-1k and KuaiRand-27k to test scalability and generalization.
+
+### Stronger Reproducibility
+
+Record the model version, prompt version, environment, dependency versions, seed, hardware, and dataset checksums for every run.
+
+## Team Member Contributions
+
+The project was divided equally among four team members.
+
+| Team member | Primary responsibility |
 |---|---|
-| `evaluate.py` | 指标实现 + 全部口径约定。**不要改。** |
-| `data.py` | 数据加载、官方划分、特征编码。加特征改这里。 |
-| `baseline.py` | 三个 baseline。FM 是要打败的那个。 |
-| `baseline_scores.json` | 官方发布的分数 + 种子方差 + 收敛参数。 |
-| `submit.py` | 生成 / 校验提交文件。 |
-| `ablation_features.py` | 特征消融实验，可复现「加特征没有收益」那组数字。 |
+| Team Member 1 | Harness |
+| Team Member 2 | Code generation |
+| Team Member 3 | LLM calls |
+| Team Member 4 | Orchestrator |
+
+All four members contributed equally to system design, integration, testing, debugging, documentation, and the final presentation.
+
+## Responsible Use
+
+- Do not commit API keys or secrets.
+- Do not use external training data.
+- Do not expose the hidden evaluation split to the agent.
+- Do not alter the official evaluation metrics.
+- Keep all experiment failures and interventions in the run record.
+- Validate the final prediction file before submission.
