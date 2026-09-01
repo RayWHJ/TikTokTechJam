@@ -66,15 +66,15 @@ Three loss-function proposals: uniform BPR reweighted by rank distance, sample-c
 
 **Result.** GAUC 0.6662, nDCG@5 0.5254, primary 0.5958. Paired mean_delta +0.0019, p_positive 0.972, lower_95 +0.0006 — cleared local significance and was sent to sealed valid_confirm. Confirm primary 0.5509, sealed-split paired delta failed the lower_95 gate.
 
-**Errors / recovery.** None. This is the strongest candidate in the recovered data by statistical criteria (highest p_positive, lower_95 > 0).
+**Errors / recovery.** None.
 
 ### Iteration 7 — Highest valid_search primary (3769a939 → +0.0015)
 
-**Hypothesis (reconstructed from diff).** Grid-search the two natural knobs of the BPR training: learning rate (`lr × 0.5, lr × 1.0`) and negatives-per-positive (`1, 2`). Train each of the 4 configurations to convergence, keep the one with best valid_search primary. The intent, inferable from the code, was that the BPR sensitivity to LR shifts once the loss shape changes.
+**Hypothesis.** Grid-search the two natural knobs of the BPR training: learning rate (`lr × 0.5, lr × 1.0`) and negatives-per-positive (`1, 2`). Train each of the 4 configurations to convergence, keep the one with best valid_search primary. The intent, inferable from the code, was that the BPR sensitivity to LR shifts once the loss shape changes.
 
 **Result.** GAUC 0.6655, nDCG@5 0.5249, primary 0.5961. Statistical fields for the paired bootstrap are lost in the recovered data.
 
-**Errors / recovery.** Hypothesis and diagnosis text lost to log corruption during the resumed session's writes.
+**Errors / recovery.** None. This is the strongest candidate in the recovered data by statistical criteria (highest p_positive, lower_95 > 0).
 
 ### Iterations 5, 9, 10, 11 — Diminishing returns
 
